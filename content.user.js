@@ -4,9 +4,6 @@
 // @version      3.1
 // @description  High-speed scanner backed by a shared Cloudflare D1 SQLite backend, tile diffing, target cadence pacing, and local IndexedDB caching.
 // @author       Dinis12481
-// @icon         https://freesvg.org/img/1646656079PixelArt-Heart-1.png
-// @updateURL    https://raw.githubusercontent.com/dinisafonsopinto/Wplace-Pixel-Analyzer/main/content.user.js
-// @downloadURL  https://raw.githubusercontent.com/dinisafonsopinto/Wplace-Pixel-Analyzer/main/content.user.js
 // @match        *://*.wplace.live/*
 // @match        *://wplace.live/*
 // @grant        GM.xmlHttpRequest
@@ -288,73 +285,83 @@
         }
     }
 
-    // --- UI Setup ---
+// --- UI Setup ---
     const panel = document.createElement('div');
     Object.assign(panel.style, {
         position: 'fixed', top: '10px', left: '10px', backgroundColor: 'rgba(20, 20, 20, 0.95)',
-        color: '#fff', padding: '15px', borderRadius: '8px', zIndex: '999999',
-        fontFamily: 'monospace', fontSize: '12px', border: '1px solid #444',
-        boxShadow: '0 4px 10px rgba(0,0,0,0.5)', width: '265px'
+        color: '#fff', padding: '10px', borderRadius: '8px', zIndex: '999999',
+        fontFamily: 'monospace', fontSize: '11px', border: '1px solid #444',
+        boxShadow: '0 4px 10px rgba(0,0,0,0.5)', width: '250px', maxWidth: 'calc(100vw - 20px)',
+        boxSizing: 'border-box'
     });
 
     panel.innerHTML = `
-    <div id="pixel-analyzer-drag-handle" style="cursor: grab; user-select: none; pointer-events: auto; background: #333; padding: 5px; margin: 0 0 10px 0;">
-        <h3 style="font-size: 13px; text-align: center; margin: 0;">Wplace Rect Analyzer</h3>
+    <div id="pixel-analyzer-drag-handle" style="cursor: grab; user-select: none; background: #333; padding: 4px 8px; margin: -10px -10px 8px -10px; display: flex; justify-content: space-between; align-items: center; border-top-left-radius: 8px; border-top-right-radius: 8px;">
+        <span style="font-weight: bold; font-size: 11px;">Wplace Rect Analyzer</span>
+        <button id="wp-toggle-btn" style="background: none; border: none; color: #fff; cursor: pointer; font-size: 14px; font-weight: bold; padding: 0 4px; line-height: 1;">−</button>
     </div>
 
-    <button id="wp-select-btn" style="width: 100%; padding: 5px; margin-bottom: 8px; cursor: pointer; color: black; background: #ddd; border: none; border-radius: 4px;" disabled>Loading Cache...</button>
+    <div id="wp-panel-content">
+        <button id="wp-select-btn" style="width: 100%; padding: 5px; margin-bottom: 6px; cursor: pointer; color: black; background: #ddd; border: none; border-radius: 4px; font-size: 11px;" disabled>Loading Cache...</button>
 
-    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 8px;">
-        <input type="number" id="wp-startx" placeholder="Start X" style="width: 100%; padding: 3px; box-sizing: border-box;">
-        <input type="number" id="wp-starty" placeholder="Start Y" style="width: 100%; padding: 3px; box-sizing: border-box;">
-        <input type="number" id="wp-endx" placeholder="End X" style="width: 100%; padding: 3px; box-sizing: border-box;">
-        <input type="number" id="wp-endy" placeholder="End Y" style="width: 100%; padding: 3px; box-sizing: border-box;">
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 6px;">
+            <input type="number" id="wp-startx" placeholder="Start X" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
+            <input type="number" id="wp-starty" placeholder="Start Y" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
+            <input type="number" id="wp-endx" placeholder="End X" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
+            <input type="number" id="wp-endy" placeholder="End Y" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
+        </div>
+
+        <details style="background: rgba(255,255,255,0.05); padding: 6px; border-radius: 4px; margin-bottom: 6px;">
+            <summary style="font-weight: bold; color: #aaa; font-size: 10px; cursor: pointer; user-select: none;">Cadence & Auto-Tuning</summary>
+
+            <div style="display: flex; justify-content: space-between; align-items: center; margin: 4px 0 2px 0;">
+                <span>Interval (ms):</span>
+                <input type="number" id="wp-delay" value="800" min="0" step="25" style="width: 60px; padding: 2px; font-size: 10px;">
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;">
+                <span>Min Floor (ms):</span>
+                <input type="number" id="wp-min-floor" value="600" min="0" step="25" style="width: 60px; padding: 2px; font-size: 10px;">
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;">
+                <span>429 Pause (s):</span>
+                <input type="number" id="wp-pause-sec" value="65" min="1" step="5" style="width: 60px; padding: 2px; font-size: 10px;">
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;">
+                <span>429 Penalty (ms):</span>
+                <input type="number" id="wp-penalty-ms" value="100" min="0" step="25" style="width: 60px; padding: 2px; font-size: 10px;">
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;">
+                <span>Speed Step (ms):</span>
+                <input type="number" id="wp-step-down" value="10" min="0" step="5" style="width: 60px; padding: 2px; font-size: 10px;">
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span>Streak for Step:</span>
+                <input type="number" id="wp-streak-reqs" value="30" min="1" step="1" style="width: 60px; padding: 2px; font-size: 10px;">
+            </div>
+        </details>
+
+        <div style="margin-bottom: 6px; font-size: 10px;">
+            <label style="cursor: pointer; display: block; margin-bottom: 2px;"><input type="checkbox" id="wp-use-diff" checked> <b>Tile Diffing</b></label>
+            <label style="cursor: pointer; display: block;"><input type="checkbox" id="wp-use-cloud" checked> <b>Cloud Sync</b></label>
+            <button id="wp-clear-cache" style="margin-top: 4px; padding: 3px 6px; background: #555; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 10px;" disabled>Clear Cache</button>
+        </div>
+
+        <button id="wp-analyze-btn" style="width: 100%; padding: 6px; cursor: pointer; border: none; border-radius: 4px; font-size: 11px; font-weight: bold;" disabled>Start Analysis</button>
+        <div id="wp-status" style="margin-top: 6px; max-height: 120px; overflow-y: auto; color: #aaa; font-size: 10px;">Initializing DB...</div>
     </div>
-
-    <div style="background: rgba(255,255,255,0.05); padding: 8px; border-radius: 4px; margin-bottom: 8px;">
-        <div style="font-weight: bold; margin-bottom: 6px; color: #aaa; font-size: 11px;">Cadence & Auto-Tuning</div>
-
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-            <span>Target Interval (ms):</span>
-            <input type="number" id="wp-delay" value="450" min="0" step="25" style="width: 70px; padding: 2px;">
-        </div>
-
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-            <span>Min Floor (ms):</span>
-            <input type="number" id="wp-min-floor" value="150" min="0" step="25" style="width: 70px; padding: 2px;">
-        </div>
-
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-            <span>429 Pause (sec):</span>
-            <input type="number" id="wp-pause-sec" value="65" min="1" step="5" style="width: 70px; padding: 2px;">
-        </div>
-
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-            <span>429 Penalty (+ms):</span>
-            <input type="number" id="wp-penalty-ms" value="100" min="0" step="25" style="width: 70px; padding: 2px;">
-        </div>
-
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-            <span>Speed Step (-ms):</span>
-            <input type="number" id="wp-step-down" value="10" min="0" step="5" style="width: 70px; padding: 2px;">
-        </div>
-
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-            <span>Streak for Step:</span>
-            <input type="number" id="wp-streak-reqs" value="30" min="1" step="1" style="width: 70px; padding: 2px;">
-        </div>
-    </div>
-
-    <div style="margin-bottom: 8px;">
-        <label style="cursor: pointer;"><input type="checkbox" id="wp-use-diff" checked> <b>Tile Diffing</b> (Skip unchanged colors)</label><br>
-        <label style="cursor: pointer;"><input type="checkbox" id="wp-use-cloud" checked> <b>Cloud Sync</b> (Shared R2 backend)</label><br>
-        <button id="wp-clear-cache" style="margin-top: 4px; padding: 3px 6px; background: #555; color: white; border: none; border-radius: 3px; cursor: pointer;" disabled>Clear Cache</button>
-    </div>
-
-    <button id="wp-analyze-btn" style="width: 100%; padding: 6px; cursor: pointer; border: none; border-radius: 4px;" disabled>Start Analysis</button>
-    <div id="wp-status" style="margin-top: 8px; max-height: 180px; overflow-y: auto; color: #aaa; font-size: 11px;">Initializing DB...</div>
     `;
     document.body.appendChild(panel);
+
+    // Minimize / Expand Handler
+    const toggleBtn = document.getElementById('wp-toggle-btn');
+    const panelContent = document.getElementById('wp-panel-content');
+    toggleBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const isHidden = panelContent.style.display === 'none';
+        panelContent.style.display = isHidden ? 'block' : 'none';
+        toggleBtn.textContent = isHidden ? '−' : '+';
+        panel.style.width = isHidden ? '250px' : 'auto';
+    });
 
     try {
         await initDB();
@@ -452,7 +459,7 @@
 
         // 1. Ingest from Shared Cloud Backend (R2)
         if (useCloud) {
-            statusDiv.innerHTML = `Checking shared cloud cache for ${intersectingTiles.length} sector(s)...`;
+            statusDiv.innerHTML = `Checking cloud cache for ${intersectingTiles.length} sector(s)...`;
             for (const { tx, ty } of intersectingTiles) {
                 if (!isScanning) break;
                 const cloudTileData = await fetchBackendTile(tx, ty);
@@ -593,8 +600,8 @@
 
                     statusDiv.innerHTML = `[${processed}/${totalPixels} • <span style="color:#55ff55">${pct}%</span>]<br>` +
                                           `Target: <b>${targetInterval}ms</b> (Floor: <b>${minFloorInterval}ms</b>)<br>` +
-                                          `Avg Cycle: <b>${Math.round(estimatedMsPerPixel)}ms</b> • ETA: <b>${etaStr}</b><br>` +
-                                          `Scanned (${x}, ${y}): ${username}`;
+                                          `Avg: <b>${Math.round(estimatedMsPerPixel)}ms</b> • ETA: <b>${etaStr}</b><br>` +
+                                          `Scanned: ${username}`;
 
                 } else if (res.status === 429) {
                     consecutiveSuccesses = 0;
@@ -609,8 +616,8 @@
                     document.getElementById('wp-delay').value = targetInterval;
 
                     statusDiv.innerHTML = `<span style="color:#ffcc00"><b>Rate Limited (429)!</b></span><br>` +
-                                          `Learned Floor: <b>${minFloorInterval}ms</b><br>` +
-                                          `Pausing ${pauseSec}s... Target set to <b>${targetInterval}ms</b>`;
+                                          `Floor: <b>${minFloorInterval}ms</b><br>` +
+                                          `Pausing ${pauseSec}s... Target: <b>${targetInterval}ms</b>`;
                     await wait(pauseSec * 1000);
                 } else {
                     statusDiv.innerHTML = `<span style="color:#ff5555">Error ${res.status || 'Network'}. Retrying in 2s...</span>`;
@@ -627,8 +634,7 @@
         }
 
         if (useCloud && fetchTasks.length > 0) {
-            statusDiv.innerHTML = `Syncing discoveries to shared R2 cloud...`;
-            // Group newly fetched pixels by sector
+            statusDiv.innerHTML = `Syncing discoveries to cloud...`;
             const cloudSyncBuckets = {};
             for (const task of fetchTasks) {
                 const { x, y, tileX, tileY, pixelX, pixelY, currentColor } = task;
@@ -646,10 +652,10 @@
         }
 
         let finalHtml = `<strong style="color: #fff">Analysis ${isScanning ? 'Complete' : 'Stopped'}!</strong><br>` +
-                        `<span style="color:#aaa; font-size:10px;">Instant (Diff): ${instantMatches} | Fetched: ${fetched}</span><br><br>`;
+                        `<span style="color:#aaa; font-size:10px;">Instant: ${instantMatches} | Fetched: ${fetched}</span><br><br>`;
         const sortedCounts = Object.entries(counts).sort((a, b) => b[1] - a[1]);
         for (const [user, count] of sortedCounts) {
-            finalHtml += `${user}: <span style="color: #55ff55">${count}</span> pixels<br>`;
+            finalHtml += `${user}: <span style="color: #55ff55">${count}</span> px<br>`;
         }
 
         statusDiv.innerHTML = finalHtml;
@@ -659,34 +665,44 @@
         document.getElementById('wp-select-btn').disabled = false;
     });
 
-    // --- Drag Handle Functionality ---
+    // --- Drag Handle Functionality (Mouse + Touch) ---
     function dragElement(elmnt, handle) {
         let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
-        handle.onmousedown = dragMouseDown;
 
-        function dragMouseDown(e) {
-            e.preventDefault();
-            pos3 = e.clientX;
-            pos4 = e.clientY;
-            document.onmouseup = closeDragElement;
-            document.onmousemove = elementDrag;
-            handle.style.cursor = 'grabbing';
+        handle.addEventListener('mousedown', dragStart);
+        handle.addEventListener('touchstart', dragStart, { passive: false });
+
+        function dragStart(e) {
+            if (e.target.id === 'wp-toggle-btn') return;
+            const touch = e.type === 'touchstart' ? e.touches[0] : e;
+            pos3 = touch.clientX;
+            pos4 = touch.clientY;
+
+            if (e.type === 'touchstart') {
+                document.addEventListener('touchend', dragEnd);
+                document.addEventListener('touchmove', elementDrag, { passive: false });
+            } else {
+                document.addEventListener('mouseup', dragEnd);
+                document.addEventListener('mousemove', elementDrag);
+            }
         }
 
         function elementDrag(e) {
             e.preventDefault();
-            pos1 = pos3 - e.clientX;
-            pos2 = pos4 - e.clientY;
-            pos3 = e.clientX;
-            pos4 = e.clientY;
-            elmnt.style.top = (elmnt.offsetTop - pos2) + "px";
-            elmnt.style.left = (elmnt.offsetLeft - pos1) + "px";
+            const touch = e.type === 'touchmove' ? e.touches[0] : e;
+            pos1 = pos3 - touch.clientX;
+            pos2 = pos4 - touch.clientY;
+            pos3 = touch.clientX;
+            pos4 = touch.clientY;
+            elmnt.style.top = Math.max(0, (elmnt.offsetTop - pos2)) + "px";
+            elmnt.style.left = Math.max(0, (elmnt.offsetLeft - pos1)) + "px";
         }
 
-        function closeDragElement() {
-            document.onmouseup = null;
-            document.onmousemove = null;
-            handle.style.cursor = 'grab';
+        function dragEnd() {
+            document.removeEventListener('mouseup', dragEnd);
+            document.removeEventListener('mousemove', elementDrag);
+            document.removeEventListener('touchend', dragEnd);
+            document.removeEventListener('touchmove', elementDrag);
         }
     }
     dragElement(panel, document.getElementById('pixel-analyzer-drag-handle'));
