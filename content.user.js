@@ -4,6 +4,9 @@
 // @version      3.1
 // @description  High-speed scanner backed by a shared Cloudflare D1 SQLite backend, tile diffing, target cadence pacing, and local IndexedDB caching.
 // @author       Dinis12481
+// @icon         https://freesvg.org/img/1646656079PixelArt-Heart-1.png
+// @updateURL    https://raw.githubusercontent.com/dinisafonsopinto/Wplace-Pixel-Analyzer/main/content.user.js
+// @downloadURL  https://raw.githubusercontent.com/dinisafonsopinto/Wplace-Pixel-Analyzer/main/content.user.js
 // @match        *://*.wplace.live/*
 // @match        *://wplace.live/*
 // @grant        GM.xmlHttpRequest
@@ -280,7 +283,7 @@
             document.getElementById('wp-endy').value = y;
             selectionStep = 0;
             statusDiv.innerHTML = `<span style="color: #55ff55">Area selected!</span><br>Ready to analyze.`;
-            document.getElementById('wp-select-btn').style.backgroundColor = '';
+            document.getElementById('wp-select-btn').style.backgroundColor = '#ddd';
             document.getElementById('wp-select-btn').textContent = 'Select Area';
         }
     }
@@ -313,32 +316,32 @@
 
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
             <span>Target Interval (ms):</span>
-            <input type="number" id="wp-delay" value="450" min="0" step="25" style="width: 70px; padding: 2px; color: black;">
+            <input type="number" id="wp-delay" value="450" min="0" step="25" style="width: 70px; padding: 2px;">
         </div>
 
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
             <span>Min Floor (ms):</span>
-            <input type="number" id="wp-min-floor" value="150" min="0" step="25" style="width: 70px; padding: 2px; color: black;">
+            <input type="number" id="wp-min-floor" value="150" min="0" step="25" style="width: 70px; padding: 2px;">
         </div>
 
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
             <span>429 Pause (sec):</span>
-            <input type="number" id="wp-pause-sec" value="65" min="1" step="5" style="width: 70px; padding: 2px; color: black;">
+            <input type="number" id="wp-pause-sec" value="65" min="1" step="5" style="width: 70px; padding: 2px;">
         </div>
 
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
             <span>429 Penalty (+ms):</span>
-            <input type="number" id="wp-penalty-ms" value="100" min="0" step="25" style="width: 70px; padding: 2px; color: black;">
+            <input type="number" id="wp-penalty-ms" value="100" min="0" step="25" style="width: 70px; padding: 2px;">
         </div>
 
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
             <span>Speed Step (-ms):</span>
-            <input type="number" id="wp-step-down" value="10" min="0" step="5" style="width: 70px; padding: 2px; color: black;">
+            <input type="number" id="wp-step-down" value="10" min="0" step="5" style="width: 70px; padding: 2px;">
         </div>
 
         <div style="display: flex; justify-content: space-between; align-items: center;">
             <span>Streak for Step:</span>
-            <input type="number" id="wp-streak-reqs" value="30" min="1" step="1" style="width: 70px; padding: 2px; color: black;">
+            <input type="number" id="wp-streak-reqs" value="30" min="1" step="1" style="width: 70px; padding: 2px;">
         </div>
     </div>
 
@@ -348,7 +351,7 @@
         <button id="wp-clear-cache" style="margin-top: 4px; padding: 3px 6px; background: #555; color: white; border: none; border-radius: 3px; cursor: pointer;" disabled>Clear Cache</button>
     </div>
 
-    <button id="wp-analyze-btn" style="width: 100%; padding: 6px; cursor: pointer; color: black; border: none; border-radius: 4px;" disabled>Start Analysis</button>
+    <button id="wp-analyze-btn" style="width: 100%; padding: 6px; cursor: pointer; border: none; border-radius: 4px;" disabled>Start Analysis</button>
     <div id="wp-status" style="margin-top: 8px; max-height: 180px; overflow-y: auto; color: #aaa; font-size: 11px;">Initializing DB...</div>
     `;
     document.body.appendChild(panel);
