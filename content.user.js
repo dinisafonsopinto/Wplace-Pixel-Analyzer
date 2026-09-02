@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Pixel Rect Analyzer
 // @namespace    http://tampermonkey.net/
-// @version      3.1
+// @version      3.2
 // @description  High-speed scanner backed by a shared Cloudflare D1 SQLite backend, tile diffing, target cadence pacing, and local IndexedDB caching.
 // @author       Dinis12481
 // @match        *://*.wplace.live/*
@@ -24,6 +24,9 @@
     let pixelCache = {};
     let db;
     let isScanning = false;
+
+    let midScanHarvested = new Set();
+    const harvestedTileData = new Map();
 
     // --- Web Worker for Unthrottled Background Timers ---
     const workerBlob = new Blob([`
@@ -109,6 +112,21 @@
             pixelX: ((absX % TILE_SIZE) + TILE_SIZE) % TILE_SIZE,
             pixelY: ((absY % TILE_SIZE) + TILE_SIZE) % TILE_SIZE
         };
+    }
+
+    // --- LocalStorage Persistence Helpers ---
+    function saveSetting(key, value) {
+        try { localStorage.setItem(`wp-analyzer-${key}`, value); } catch (e) {}
+    }
+
+    function loadSetting(key, fallback) {
+        try {
+            const val = localStorage.getItem(`wp-analyzer-${key}`);
+            console.log(`Loaded setting ${key}: ${val}`);
+            return val !== null ? val : fallback;
+        } catch (e) {
+            return fallback;
+        }
     }
 
     // --- Cloudflare Shared Backend API Calls ---
@@ -215,6 +233,24 @@
     }
 
     // --- Passive Click Harvesting ---
+    async function getHarvestedPixelColor(tileX, tileY, pixelX, pixelY) {
+        const tileKey = `${tileX}_${tileY}`;
+    
+        let tileData = harvestedTileData.get(tileKey);
+    
+        if (!tileData) {
+            try {
+                tileData = await fetchTileImageData(tileX, tileY);
+                harvestedTileData.set(tileKey, tileData);
+            } catch (err) {
+                console.warn(`Failed to fetch tile color for (${tileX}, ${tileY})`, err);
+                return null;
+            }
+        }
+    
+        return getTilePixelColor(tileData, pixelX, pixelY);
+    }
+
     const hookScript = document.createElement('script');
     hookScript.textContent = `(${function() {
         const origFetch = window.fetch;
@@ -255,7 +291,12 @@
         const localKey = `${pixelX}_${pixelY}`;
         const existing = pixelCache[cacheKey];
 
-        const record = { u: username, c: existing ? existing.c : null };
+        // Don't overwrite an identical existing record.
+        // But if it exists without a color, we still want to repair it.
+        if (existing && existing.u === username && existing.c !== null) return;
+
+        const color = existing?.c ?? await getHarvestedPixelColor(tileX, tileY, pixelX, pixelY);
+        const record = { u: username, c: color };
         pixelCache[cacheKey] = record;
 
         if (db) {
@@ -263,6 +304,8 @@
             const clearBtn = document.getElementById('wp-clear-cache');
             if (clearBtn) clearBtn.textContent = `Clear Cache (${Object.keys(pixelCache).length})`;
         }
+
+        if (isScanning) midScanHarvested.add(cacheKey);
 
         // Fire-and-forget push to shared backend
         syncBackendTile(tileX, tileY, { [localKey]: record });
@@ -273,11 +316,15 @@
         if (selectionStep === 1) {
             document.getElementById('wp-startx').value = x;
             document.getElementById('wp-starty').value = y;
+            saveSetting('startx', x);
+            saveSetting('starty', y);
             selectionStep = 2;
             statusDiv.innerHTML = `<span style="color: #55ff55">Corner 1 set at (${x}, ${y}).</span><br>Click opposite corner...`;
         } else if (selectionStep === 2) {
             document.getElementById('wp-endx').value = x;
             document.getElementById('wp-endy').value = y;
+            saveSetting('endx', x);
+            saveSetting('endy', y);
             selectionStep = 0;
             statusDiv.innerHTML = `<span style="color: #55ff55">Area selected!</span><br>Ready to analyze.`;
             document.getElementById('wp-select-btn').style.backgroundColor = '#ddd';
@@ -285,7 +332,7 @@
         }
     }
 
-// --- UI Setup ---
+    // --- UI Setup ---
     const panel = document.createElement('div');
     Object.assign(panel.style, {
         position: 'fixed', top: '10px', left: '10px', backgroundColor: 'rgba(20, 20, 20, 0.95)',
@@ -305,10 +352,10 @@
         <button id="wp-select-btn" style="width: 100%; padding: 5px; margin-bottom: 6px; cursor: pointer; color: black; background: #ddd; border: none; border-radius: 4px; font-size: 11px;" disabled>Loading Cache...</button>
 
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 6px;">
-            <input type="number" id="wp-startx" placeholder="Start X" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
-            <input type="number" id="wp-starty" placeholder="Start Y" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
-            <input type="number" id="wp-endx" placeholder="End X" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
-            <input type="number" id="wp-endy" placeholder="End Y" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
+            <input type="number" id="wp-startx" placeholder="Start X" value="" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
+            <input type="number" id="wp-starty" placeholder="Start Y" value="" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
+            <input type="number" id="wp-endx" placeholder="End X" value="" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
+            <input type="number" id="wp-endy" placeholder="End Y" value="" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
         </div>
 
         <details style="background: rgba(255,255,255,0.05); padding: 6px; border-radius: 4px; margin-bottom: 6px;">
@@ -316,27 +363,27 @@
 
             <div style="display: flex; justify-content: space-between; align-items: center; margin: 4px 0 2px 0;">
                 <span>Interval (ms):</span>
-                <input type="number" id="wp-delay" value="800" min="0" step="25" style="width: 60px; padding: 2px; font-size: 10px;">
+                <input type="number" id="wp-delay" min="0" step="25" style="width: 60px; padding: 2px; font-size: 10px;">
             </div>
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;">
                 <span>Min Floor (ms):</span>
-                <input type="number" id="wp-min-floor" value="600" min="0" step="25" style="width: 60px; padding: 2px; font-size: 10px;">
+                <input type="number" id="wp-min-floor" min="0" step="25" style="width: 60px; padding: 2px; font-size: 10px;">
             </div>
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;">
                 <span>429 Pause (s):</span>
-                <input type="number" id="wp-pause-sec" value="65" min="1" step="5" style="width: 60px; padding: 2px; font-size: 10px;">
+                <input type="number" id="wp-pause-sec" min="1" step="5" style="width: 60px; padding: 2px; font-size: 10px;">
             </div>
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;">
                 <span>429 Penalty (ms):</span>
-                <input type="number" id="wp-penalty-ms" value="100" min="0" step="25" style="width: 60px; padding: 2px; font-size: 10px;">
+                <input type="number" id="wp-penalty-ms" min="0" step="25" style="width: 60px; padding: 2px; font-size: 10px;">
             </div>
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px;">
                 <span>Speed Step (ms):</span>
-                <input type="number" id="wp-step-down" value="10" min="0" step="5" style="width: 60px; padding: 2px; font-size: 10px;">
+                <input type="number" id="wp-step-down" min="0" step="5" style="width: 60px; padding: 2px; font-size: 10px;">
             </div>
             <div style="display: flex; justify-content: space-between; align-items: center;">
                 <span>Streak for Step:</span>
-                <input type="number" id="wp-streak-reqs" value="30" min="1" step="1" style="width: 60px; padding: 2px; font-size: 10px;">
+                <input type="number" id="wp-streak-reqs" min="1" step="1" style="width: 60px; padding: 2px; font-size: 10px;">
             </div>
         </details>
 
@@ -366,12 +413,33 @@
     try {
         await initDB();
         await loadCacheToRAM();
+
+        // --- UI Setup ---
         document.getElementById('wp-clear-cache').textContent = `Clear Cache (${Object.keys(pixelCache).length})`;
         document.getElementById('wp-select-btn').textContent = 'Select Area';
         document.getElementById('wp-select-btn').disabled = false;
         document.getElementById('wp-analyze-btn').disabled = false;
         document.getElementById('wp-clear-cache').disabled = false;
         document.getElementById('wp-status').textContent = 'Ready.';
+
+        document.getElementById('wp-startx').value = loadSetting('startx', '');
+        document.getElementById('wp-starty').value = loadSetting('starty', '');
+        document.getElementById('wp-endx').value = loadSetting('endx', '');
+        document.getElementById('wp-endy').value = loadSetting('endy', '');
+
+        document.getElementById('wp-delay').value = loadSetting('delay', '800');
+        document.getElementById('wp-min-floor').value = loadSetting('min-floor', '600');
+        document.getElementById('wp-pause-sec').value = loadSetting('pause-sec', '65');
+        document.getElementById('wp-penalty-ms').value = loadSetting('penalty-ms', '100');
+        document.getElementById('wp-step-down').value = loadSetting('step-down', '10');
+        document.getElementById('wp-streak-reqs').value = loadSetting('streak-reqs', '30');
+
+        // --- Save Inputs Automatically on Change ---
+        const inputIds = ['wp-startx', 'wp-starty', 'wp-endx', 'wp-endy', 'wp-delay', 'wp-min-floor', 'wp-pause-sec', 'wp-penalty-ms', 'wp-step-down', 'wp-streak-reqs'];
+        inputIds.forEach(id => {
+            const el = document.getElementById(id);
+            el.addEventListener('input', () => saveSetting(id.replace('wp-', ''), el.value));
+        });
     } catch (e) {
         document.getElementById('wp-status').innerHTML = `<span style='color:red'>Failed to init Database.</span>`;
     }
@@ -437,6 +505,7 @@
         const totalPixels = (maxX - minX + 1) * (maxY - minY + 1);
 
         isScanning = true;
+        midScanHarvested.clear();
         btn.textContent = 'Stop Analysis';
         btn.style.backgroundColor = '#ffaaaa';
         document.getElementById('wp-select-btn').disabled = true;
@@ -457,24 +526,67 @@
             }
         }
 
-        // 1. Ingest from Shared Cloud Backend (R2)
+        // 1. Ingest & Reconcile Shared Cloud Backend
         if (useCloud) {
-            statusDiv.innerHTML = `Checking cloud cache for ${intersectingTiles.length} sector(s)...`;
+            statusDiv.innerHTML = `Syncing cloud cache for ${intersectingTiles.length} sector(s)...`;
+            
+            // --- PRE-COMPUTE: Bucket only the relevant local pixels to avoid 1,000,000 grid iterations ---
+            const localTiles = {};
+            const activeTiles = new Set(intersectingTiles.map(t => `${t.tx}_${t.ty}`));
+
+            for (const [globalKey, record] of Object.entries(pixelCache)) {
+                const [gx, gy] = globalKey.split('_').map(Number);
+                const tx = Math.floor(gx / TILE_SIZE);
+                const ty = Math.floor(gy / TILE_SIZE);
+                const tileKey = `${tx}_${ty}`;
+                
+                if (activeTiles.has(tileKey)) {
+                    if (!localTiles[tileKey]) localTiles[tileKey] = {};
+                    
+                    const px = ((gx % TILE_SIZE) + TILE_SIZE) % TILE_SIZE;
+                    const py = ((gy % TILE_SIZE) + TILE_SIZE) % TILE_SIZE;
+                    localTiles[tileKey][`${px}_${py}`] = { globalKey, record };
+                }
+            }
+
             for (const { tx, ty } of intersectingTiles) {
                 if (!isScanning) break;
                 const cloudTileData = await fetchBackendTile(tx, ty);
                 const localBatch = {};
-                for (const [coordKey, val] of Object.entries(cloudTileData)) {
-                    const [px, py] = coordKey.split('_').map(Number);
-                    const globalKey = `${(tx * TILE_SIZE) + px}_${(ty * TILE_SIZE) + py}`;
-                    if (!pixelCache[globalKey]) {
-                        pixelCache[globalKey] = val;
-                        localBatch[globalKey] = val;
+                const missingFromCloud = {};
+                
+                const tileKey = `${tx}_${ty}`;
+                const localPixelsInTile = localTiles[tileKey] || {};
+                
+                const baseGlobalX = tx * TILE_SIZE;
+                const baseGlobalY = ty * TILE_SIZE;
+
+                // A. Pull new discoveries from Cloud into Local Cache
+                for (const [localKey, cloudRecord] of Object.entries(cloudTileData)) {
+                    if (!localPixelsInTile[localKey]) {
+                        const [px, py] = localKey.split('_').map(Number);
+                        const globalKey = `${baseGlobalX + px}_${baseGlobalY + py}`;
+                        pixelCache[globalKey] = cloudRecord;
+                        localBatch[globalKey] = cloudRecord;
                     }
                 }
+
+                // B. Find local pixels in this sector that Cloudflare doesn't have yet
+                for (const [localKey, localData] of Object.entries(localPixelsInTile)) {
+                    if (!cloudTileData[localKey]) {
+                        missingFromCloud[localKey] = localData.record;
+                    }
+                }
+
+                // Save new cloud items locally
                 if (Object.keys(localBatch).length > 0) {
                     await saveBatchToDB(localBatch);
                     document.getElementById('wp-clear-cache').textContent = `Clear Cache (${Object.keys(pixelCache).length})`;
+                }
+
+                // Push orphaned local items to Cloudflare
+                if (Object.keys(missingFromCloud).length > 0) {
+                    await syncBackendTile(tx, ty, missingFromCloud);
                 }
             }
         }
@@ -546,12 +658,18 @@
 
             const { x, y, tileX, tileY, pixelX, pixelY, currentColor } = task;
             const cacheKey = `${x}_${y}`;
-            let resolved = false;
 
+            // Skip if the passive harvester grabbed it while we were waiting
+            if (midScanHarvested.has(cacheKey)) {
+                processed++;
+                uncachedRemaining--;
+                continue; 
+            }
+
+            let resolved = false;
             while (!resolved && isScanning) {
                 const cycleStartTime = performance.now();
                 const res = await fetchPixelData(tileX, tileY, pixelX, pixelY);
-                const fetchDuration = performance.now() - cycleStartTime;
 
                 if (res.success) {
                     const username = res.data?.paintedBy?.name || "Blank / Unknown";
@@ -581,6 +699,7 @@
 
                     resolved = true;
 
+                    const fetchDuration = performance.now() - cycleStartTime; // now includes the amount of time
                     const remainingSleep = Math.max(0, targetInterval - fetchDuration);
                     if (fetchTasks.length > 0 && isScanning && remainingSleep > 0) {
                         await wait(remainingSleep);
@@ -618,6 +737,9 @@
                     statusDiv.innerHTML = `<span style="color:#ffcc00"><b>Rate Limited (429)!</b></span><br>` +
                                           `Floor: <b>${minFloorInterval}ms</b><br>` +
                                           `Pausing ${pauseSec}s... Target: <b>${targetInterval}ms</b>`;
+                    console.warn(`Rate Limited (429)! Pausing ${pauseSec}s... Target: ${targetInterval}ms`);
+                    console.log(`Avg: ${estimatedMsPerPixel}ms, min: ${minFloorInterval}ms, cur: ${targetInterval}ms`);
+                    console.log(`Processed: ${processed}, Remaining: ${uncachedRemaining}, Fetched: ${fetched}`);
                     await wait(pauseSec * 1000);
                 } else {
                     statusDiv.innerHTML = `<span style="color:#ff5555">Error ${res.status || 'Network'}. Retrying in 2s...</span>`;
