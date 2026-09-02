@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Pixel Rect Analyzer
 // @namespace    http://tampermonkey.net/
-// @version      3.3
+// @version      3.4
 // @description  High-speed scanner backed by a shared Cloudflare D1 SQLite backend, tile diffing, target cadence pacing, and local IndexedDB caching.
 // @author       Dinis12481
 // @match        *://*.wplace.live/*
@@ -715,11 +715,18 @@
 
                     const actualCycleDuration = performance.now() - cycleStartTime;
 
-                    if (!hasMeasuredFirst) {
+                    if (hasMeasuredFirst) {
+                        const diff = actualCycleDuration - estimatedMsPerPixel;
+                    
+                        const weight =
+                            actualCycleDuration < estimatedMsPerPixel
+                                ? 0.8  // react quickly when things get faster
+                                : 0.05; // smooth increases
+                    
+                        estimatedMsPerPixel += diff * weight;
+                    } else {
                         estimatedMsPerPixel = actualCycleDuration;
                         hasMeasuredFirst = true;
-                    } else {
-                        estimatedMsPerPixel = (estimatedMsPerPixel * 0.95) + (actualCycleDuration * 0.05);
                     }
 
                     const pct = ((processed / totalPixels) * 100).toFixed(1);
