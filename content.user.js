@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Pixel Rect Analyzer
 // @namespace    http://tampermonkey.net/
-// @version      3.2
+// @version      3.3
 // @description  High-speed scanner backed by a shared Cloudflare D1 SQLite backend, tile diffing, target cadence pacing, and local IndexedDB caching.
 // @author       Dinis12481
 // @match        *://*.wplace.live/*
@@ -133,11 +133,19 @@
     function fetchBackendTile(tileX, tileY) {
         return new Promise((resolve) => {
             if (!SHARED_BACKEND_URL || SHARED_BACKEND_URL.includes("YOUR-WORKER-SUBDOMAIN")) return resolve({});
+
+            // Append a timestamp cache-buster to bypass Cloudflare CDN
+            const cacheBuster = Date.now();
+            const url = `${SHARED_BACKEND_URL}/tile/${tileX}/${tileY}?t=${cacheBuster}`;
+
             const gmXhr = typeof GM !== 'undefined' && GM.xmlHttpRequest ? GM.xmlHttpRequest : GM_xmlhttpRequest;
             gmXhr({
                 method: "GET",
-                url: `${SHARED_BACKEND_URL}/tile/${tileX}/${tileY}`,
-                headers: { "Accept": "application/json" },
+                url: url,
+                headers: { 
+                    "Accept": "application/json",
+                    "Cache-Control": "no-cache" // Extra instruction for local browser cache
+                },
                 onload: (response) => {
                     if (response.status === 200) {
                         try { resolve(JSON.parse(response.responseText)); } catch (e) { resolve({}); }
