@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Pixel Rect Analyzer
 // @namespace    http://tampermonkey.net/
-// @version      3.4
+// @version      4.0
 // @description  High-speed scanner backed by a shared Cloudflare D1 SQLite backend, tile diffing, target cadence pacing, and local IndexedDB caching.
 // @author       Dinis12481
 // @match        *://*.wplace.live/*
@@ -24,6 +24,28 @@
     let pixelCache = {};
     let db;
     let isScanning = false;
+
+    let localUsername = "Local User"; // Fallback
+
+    function fetchLocalUsername() {
+        const gmXhr = typeof GM !== 'undefined' && GM.xmlHttpRequest ? GM.xmlHttpRequest : GM_xmlhttpRequest;
+        gmXhr({
+            method: "GET",
+            url: "https://backend.wplace.live/me",
+            headers: { "Accept": "application/json" },
+            onload: (response) => {
+                if (response.status === 200) {
+                    try {
+                        const data = JSON.parse(response.responseText);
+                        if (data && data.name) {
+                            localUsername = data.name;
+                            console.log("[Wplace Analyzer] Cached local username:", localUsername);
+                        }
+                    } catch (e) {}
+                }
+            }
+        });
+    }
 
     let midScanHarvested = new Set();
     const harvestedTileData = new Map();
@@ -263,60 +285,213 @@
     hookScript.textContent = `(${function() {
         const origFetch = window.fetch;
         window.fetch = async (...args) => {
+            const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) ? args[0].url : '';
+            const reqOpts = args[1] || {};
+            const method = reqOpts.method || 'GET';
+            
+            // Let the request hit the server first
             const response = await origFetch(...args);
+            
             try {
-                const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) ? args[0].url : '';
+                // 1. Intercept Outbound Paint Requests AFTER they succeed
+                if (method === 'POST' && url.includes('/paint') && response.ok) {
+                    const payload = JSON.parse(reqOpts.body);
+                    if (payload.tiles && Array.isArray(payload.tiles)) {
+                        const paintedCoords = [];
+                        payload.tiles.forEach(tile => {
+                            const tx = tile.x;
+                            const ty = tile.y;
+                            const pxs = tile.pixels?.x || [];
+                            const pys = tile.pixels?.y || [];
+                            const colors = tile.pixels?.colors || [];
+    
+                            for (let i = 0; i < pxs.length; i++) {
+                                paintedCoords.push({ 
+                                    tileX: tx, tileY: ty, 
+                                    pixelX: pxs[i], pixelY: pys[i], 
+                                    colorId: colors[i] - 1, // why don't the colors start at 0???
+                                });
+                            }
+                        });
+                        // Fire an event containing the batched coordinates
+                        window.dispatchEvent(new CustomEvent('wp-pixels-painted', { detail: paintedCoords }));
+                    }
+                }
+                
+                // 2. Your Existing Inbound Response Interception (/pixel/...)
                 if (url.includes('/pixel/')) {
                     const match = url.match(/\/pixel\/(-?\d+)\/(-?\d+)\?x=(\d+)&y=(\d+)/);
                     if (match) {
                         const globalX = (parseInt(match[1], 10) * 1000) + parseInt(match[3], 10);
                         const globalY = (parseInt(match[2], 10) * 1000) + parseInt(match[4], 10);
                         window.dispatchEvent(new CustomEvent('wp-pixel-clicked', { detail: { x: globalX, y: globalY } }));
-
+    
                         const clone = response.clone();
                         clone.json().then(data => {
                             const username = data?.paintedBy?.name || "Blank / Unknown";
                             window.dispatchEvent(new CustomEvent('wp-pixel-harvested', {
-                                detail: { x: globalX, y: globalY, tileX: parseInt(match[1], 10), tileY: parseInt(match[2], 10), pixelX: parseInt(match[3], 10), pixelY: parseInt(match[4], 10), username: username }
+                                detail: { 
+                                    x: globalX, y: globalY, 
+                                    tileX: parseInt(match[1], 10), tileY: parseInt(match[2], 10), 
+                                    pixelX: parseInt(match[3], 10), pixelY: parseInt(match[4], 10), 
+                                    username: username 
+                                }
                             }));
                         }).catch(() => {});
                     }
                 }
             } catch(e) {}
+            
             return response;
         };
     }.toString()})();`;
     document.documentElement.appendChild(hookScript);
     hookScript.remove();
 
+    const PALETTE = {
+        // === FREE COLORS (Indices 0 - 30) ===
+        0: 0x000000,  // Black
+        1: 0x3C3C3C,  // Dark Gray
+        2: 0x787878,  // Gray
+        3: 0xD2D2D2,  // Light Gray
+        4: 0xFFFFFF,  // White
+        5: 0x600018,  // Deep Red
+        6: 0xED1C24,  // Red
+        7: 0xFF7F27,  // Orange
+        8: 0xF6AA09,  // Gold
+        9: 0xF9DD3B,  // Yellow
+        10: 0xFFFABC, // Light Yellow
+        11: 0x0EB968, // Dark Green
+        12: 0x13E67B, // Green
+        13: 0x87FF5E, // Light Green
+        14: 0x0C816E, // Dark Teal
+        15: 0x10AEA6, // Teal
+        16: 0x13E1BE, // Light Teal
+        17: 0x60F7F2, // Cyan
+        18: 0x28509E, // Dark Blue
+        19: 0x4093E4, // Blue
+        20: 0x6B50F6, // Indigo
+        21: 0x99B1FB, // Light Indigo
+        22: 0x780C99, // Dark Purple
+        23: 0xAA38B9, // Purple
+        24: 0xE09FF9, // Light Purple
+        25: 0xCB007A, // Dark Pink
+        26: 0xEC1F80, // Pink
+        27: 0xF38DA9, // Light Pink
+        28: 0x684634, // Dark Brown
+        29: 0x95682A, // Brown
+        30: 0xF8B277, // Beige
+    
+        // === PREMIUM COLORS (Indices 31 - 62) ===
+        31: 0xAAAAAA, // Medium Gray
+        32: 0xA50E1E, // Dark Red
+        33: 0xFA8072, // Light Red
+        34: 0xE45C1A, // Dark Orange
+        35: 0x9C8431, // Olive
+        36: 0xC5AD31, // Golden Green
+        37: 0xE8D45F, // Lemon Green
+        38: 0x4A6B3A, // Forest Green
+        39: 0x5A944A, // Grass Green
+        40: 0x84C573, // Light Green (Sage)
+        41: 0x0F799F, // Ocean Blue
+        42: 0xBBFAF2, // Light Cyan
+        43: 0x7DC7FF, // Light Blue
+        44: 0x4D31B8, // Deep Purple
+        45: 0x4A4284, // Dark Purple Gray
+        46: 0x7A71C4, // Purple Gray
+        47: 0xB5AEF1, // Light Slate Blue
+        48: 0x9B5249, // Brown Red
+        49: 0xD18078, // Rose Gold
+        50: 0xFAB6A4, // Peach
+        51: 0xDBA463, // Light Brown
+        52: 0x7B6352, // Dark Tan
+        53: 0x9C846B, // Tan
+        54: 0xD6B594, // Light Tan
+        55: 0xD18051, // Dark Beige
+        56: 0xFFC5A5, // Light Beige
+        57: 0x6D643F, // Dark Stone
+        58: 0x948C6B, // Stone
+        59: 0xCDC59E, // Light Stone
+        60: 0x333941, // Dark Slate
+        61: 0x6D758D, // Slate
+        62: 0xB3B9D1  // Light Slate
+    };
+
+    window.addEventListener('wp-pixels-painted', (e) => {
+        const paintedCoords = e.detail;
+        if (!paintedCoords || paintedCoords.length === 0) return;
+
+        for (const coord of paintedCoords) {
+            const { tileX, tileY, pixelX, pixelY, colorId } = coord;
+            const globalX = (tileX * 1000) + pixelX;
+            const globalY = (tileY * 1000) + pixelY;
+            
+            const exactColor = PALETTE[colorId];
+            if (exactColor === undefined) {
+                console.warn(`[Wplace Analyzer] Unknown color ID ${colorId}. Skipping local cache update.`);
+                continue; 
+            }
+
+            // Instantly inject into the cache pipeline without querying the server!
+            window.dispatchEvent(new CustomEvent('wp-pixel-harvested', {
+                detail: { 
+                    x: globalX, 
+                    y: globalY, 
+                    tileX: tileX, 
+                    tileY: tileY, 
+                    pixelX: pixelX, 
+                    pixelY: pixelY, 
+                    username: localUsername,
+                    exactColor: exactColor,
+                }
+            }));
+        }
+    });
+
     window.addEventListener('wp-pixel-clicked', (e) => {
         if (selectionStep > 0) handleCanvasClick(e.detail.x, e.detail.y);
     });
 
+    let outboundSyncQueue = {};
+    let syncTimeout = null;
+
     window.addEventListener('wp-pixel-harvested', async (e) => {
-        const { x, y, tileX, tileY, pixelX, pixelY, username } = e.detail;
+        const { x, y, tileX, tileY, pixelX, pixelY, username, exactColor } = e.detail;
         const cacheKey = `${x}_${y}`;
         const localKey = `${pixelX}_${pixelY}`;
         const existing = pixelCache[cacheKey];
-
-        // Don't overwrite an identical existing record.
-        // But if it exists without a color, we still want to repair it.
-        if (existing && existing.u === username && existing.c !== null) return;
-
-        const color = existing?.c ?? await getHarvestedPixelColor(tileX, tileY, pixelX, pixelY);
+    
+        // FIX: Only exit early if both the username AND the exact color match
+        if (existing && existing.u === username && existing.c !== null) {
+            if (exactColor === undefined || existing.c === exactColor) return;
+        }
+    
+        const color = exactColor ?? existing?.c ?? await getHarvestedPixelColor(tileX, tileY, pixelX, pixelY);
         const record = { u: username, c: color };
         pixelCache[cacheKey] = record;
-
+    
         if (db) {
-            await saveBatchToDB({ [cacheKey]: record });
+            saveBatchToDB({ [cacheKey]: record }); // Fire-and-forget
             const clearBtn = document.getElementById('wp-clear-cache');
             if (clearBtn) clearBtn.textContent = `Clear Cache (${Object.keys(pixelCache).length})`;
         }
-
+    
         if (isScanning) midScanHarvested.add(cacheKey);
-
-        // Fire-and-forget push to shared backend
-        syncBackendTile(tileX, tileY, { [localKey]: record });
+    
+        // FIX: Queue the outbound syncs to prevent Cloudflare D1 database locking
+        const sectorKey = `${tileX}_${tileY}`;
+        if (!outboundSyncQueue[sectorKey]) {
+            outboundSyncQueue[sectorKey] = { tx: tileX, ty: tileY, data: {} };
+        }
+        outboundSyncQueue[sectorKey].data[localKey] = record;
+    
+        clearTimeout(syncTimeout);
+        syncTimeout = setTimeout(() => {
+            for (const bucket of Object.values(outboundSyncQueue)) {
+                syncBackendTile(bucket.tx, bucket.ty, bucket.data);
+            }
+            outboundSyncQueue = {}; // Reset queue after sending
+        }, 1500); // Waits 1.5 seconds after your last paint to send the batch
     });
 
     function handleCanvasClick(x, y) {
@@ -421,6 +596,7 @@
     try {
         await initDB();
         await loadCacheToRAM();
+        fetchLocalUsername();
 
         // --- UI Setup ---
         document.getElementById('wp-clear-cache').textContent = `Clear Cache (${Object.keys(pixelCache).length})`;
@@ -730,9 +906,10 @@
                     }
 
                     const pct = ((processed / totalPixels) * 100).toFixed(1);
+                    const pctFetched = ((fetched / totalPixels) * 100).toFixed(1);
                     const etaStr = formatETA(Math.round((uncachedRemaining * estimatedMsPerPixel) / 1000));
 
-                    statusDiv.innerHTML = `[${processed}/${totalPixels} • <span style="color:#55ff55">${pct}%</span>]<br>` +
+                    statusDiv.innerHTML = `[${processed}/${totalPixels} • <span style="color:#55ff55">${pct}%</span> • <span style="color:#55d2ff">${pctFetched}%</span>]<br>` +
                                           `Target: <b>${targetInterval}ms</b> (Floor: <b>${minFloorInterval}ms</b>)<br>` +
                                           `Avg: <b>${Math.round(estimatedMsPerPixel)}ms</b> • ETA: <b>${etaStr}</b><br>` +
                                           `Scanned: ${username}`;
