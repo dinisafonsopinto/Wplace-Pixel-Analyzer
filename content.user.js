@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Pixel Rect Analyzer
 // @namespace    http://tampermonkey.net/
-// @version      4.0
+// @version      4.1
 // @description  High-speed scanner backed by a shared Cloudflare D1 SQLite backend, tile diffing, target cadence pacing, and local IndexedDB caching.
 // @author       Dinis12481
 // @match        *://*.wplace.live/*
@@ -350,6 +350,7 @@
 
     const PALETTE = {
         // === FREE COLORS (Indices 0 - 30) ===
+        '-1': -1,     // transparent
         0: 0x000000,  // Black
         1: 0x3C3C3C,  // Dark Gray
         2: 0x787878,  // Gray
