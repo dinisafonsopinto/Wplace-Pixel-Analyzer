@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Pixel Rect Analyzer
 // @namespace    http://tampermonkey.net/
-// @version      5.0
+// @version      5.1
 // @description  High-speed scanner backed by a shared Cloudflare D1 SQLite backend, tile diffing, target cadence pacing, and local IndexedDB caching.
 // @author       Dinis12481
 // @match        *://*.wplace.live/*
@@ -281,8 +281,11 @@
                             if (newKey) {
                                 secretKey = newKey;
                                 saveSetting('sync-token', newKey);
-                                syncBackendTile(tileX, tileY, chunkData);
+                                attempt(1); // reset back to attempt 1
+                                return;
                             }
+
+                            resolve();
                             return;
                         }
                         if (res.status >= 400) {
@@ -962,7 +965,7 @@
         document.getElementById('wp-use-expand').checked = loadBool('use-expand', false);
 
         // --- Save Inputs Automatically on Change ---
-        const inputIds = ['wp-delay', 'wp-min-floor', 'wp-pause-sec', 'wp-penalty-ms', 'wp-step-down', 'wp-streak-reqs', 'wp-use-cloud-upload', 'wp-use-cloud-download', 'wp-use-diff', 'wp-use-expand'];
+        const inputIds = ['wp-delay', 'wp-min-floor', 'wp-pause-sec', 'wp-penalty-ms', 'wp-step-down', 'wp-streak-reqs', 'wp-use-diff', 'wp-use-expand'];
 
         inputIds.forEach(id => {
             const el = document.getElementById(id);
@@ -974,6 +977,19 @@
                 saveSetting(id.replace('wp-', ''), val);
             });
         });
+        // custom for cloud upload (must also have download checked)
+        document.getElementById('wp-use-cloud-upload').addEventListener('change', () => {
+            if (document.getElementById('wp-use-cloud-upload').checked) {
+                document.getElementById('wp-use-cloud-download').checked = true;
+                saveSetting('use-cloud-download', 'true');
+            }
+        })
+        document.getElementById('wp-use-cloud-download').addEventListener('change', () => {
+            if (!document.getElementById('wp-use-cloud-download').checked) {
+                document.getElementById('wp-use-cloud-upload').checked = false;
+                saveSetting('use-cloud-upload', 'false');
+            }
+        })
     } catch (e) {
         document.getElementById('wp-status').innerHTML = `<span style='color:red'>Failed to init Database.</span>`;
     }
@@ -1168,7 +1184,7 @@
         }
 
         // 1. Ingest & Reconcile Shared Cloud Backend
-        if (useCloudDownload) {
+        if (useCloudDownload || useCloudUpload) {
             statusDiv.innerHTML = `Syncing cloud cache for ${intersectingTiles.length} sector(s)...`;
             
             await refreshAuthors();
@@ -1213,23 +1229,25 @@
                         localBatch[globalKey] = cloudRecord;
                     }
                 }
-
-                // B. Find local pixels in this sector that Cloudflare doesn't have yet
-                for (const [localKey, localData] of Object.entries(localPixelsInTile)) {
-                    if (!cloudTileData[localKey]) {
-                        missingFromCloud[localKey] = localData.record;
-                    }
-                }
-
+                
                 // Save new cloud items locally
                 if (Object.keys(localBatch).length > 0) {
                     await saveBatchToDB(localBatch);
                     document.getElementById('wp-clear-cache').textContent = `Clear Cache (${Object.keys(pixelCache).length})`;
                 }
 
-                // Push orphaned local items to Cloudflare
-                if (Object.keys(missingFromCloud).length > 0) {
-                    await syncBackendTile(tx, ty, missingFromCloud);
+                // B. Find local pixels in this sector that Cloudflare doesn't have yet
+                if (useCloudUpload) {
+                    for (const [localKey, localData] of Object.entries(localPixelsInTile)) {
+                        if (!cloudTileData[localKey]) {
+                            missingFromCloud[localKey] = localData.record;
+                        }
+                    }
+                    
+                    // Push orphaned local items to Cloudflare
+                    if (Object.keys(missingFromCloud).length > 0) {
+                        await syncBackendTile(tx, ty, missingFromCloud);
+                    }
                 }
             }
         }
