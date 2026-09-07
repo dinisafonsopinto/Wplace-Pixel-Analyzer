@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Wplace Pixel Rect Analyzer
 // @namespace    http://tampermonkey.net/
-// @version      4.0
+// @version      5.0
 // @description  High-speed scanner backed by a shared Cloudflare D1 SQLite backend, tile diffing, target cadence pacing, and local IndexedDB caching.
 // @author       Dinis12481
 // @match        *://*.wplace.live/*
@@ -18,16 +18,21 @@
 
     // Set your Cloudflare Worker URL here:
     const SHARED_BACKEND_URL = "https://wplace-sync.dinisafonsopinto.workers.dev";
+    let secretKey = loadSetting('sync-token', '');
 
-    const TILE_SIZE = 1000;
+    const TILE_SIZE = 1000; // 1000x1000 pixels
     let selectionStep = 0;
     let pixelCache = {};
     let db;
     let isScanning = false;
+    let polygonVertices = [];
 
-    let localUsername = "Local User"; // Fallback
+    let localUsername = "Local User";
+    let localUserUid = null;
+    let localUserAid = null;
+    let localUserAn = null;
 
-    function fetchLocalUsername() {
+    function fetchLocalUserInfo() {
         const gmXhr = typeof GM !== 'undefined' && GM.xmlHttpRequest ? GM.xmlHttpRequest : GM_xmlhttpRequest;
         gmXhr({
             method: "GET",
@@ -39,7 +44,9 @@
                         const data = JSON.parse(response.responseText);
                         if (data && data.name) {
                             localUsername = data.name;
-                            console.log("[Wplace Analyzer] Cached local username:", localUsername);
+                            localUserUid = data.id || null;
+                            localUserAid = data.allianceId || null;
+                            localUserAn = data.allianceName || null;
                         }
                     } catch (e) {}
                 }
@@ -50,18 +57,30 @@
     let midScanHarvested = new Set();
     const harvestedTileData = new Map();
 
-    // --- Web Worker for Unthrottled Background Timers ---
+    // --- Web Worker for Unthrottled Background Timers (Concurrent Safe) ---
     const workerBlob = new Blob([`
         self.onmessage = function(e) {
-            setTimeout(() => self.postMessage('tick'), e.data);
+            setTimeout(() => self.postMessage(e.data.id), e.data.ms);
         };
     `], { type: 'application/javascript' });
     const timerWorker = new Worker(URL.createObjectURL(workerBlob));
 
+    let waitIdCounter = 0;
+    const pendingWaits = new Map();
+
+    timerWorker.onmessage = (e) => {
+        const resolveCb = pendingWaits.get(e.data);
+        if (resolveCb) {
+            resolveCb();
+            pendingWaits.delete(e.data);
+        }
+    };
+
     const wait = (ms) => new Promise(resolve => {
         if (ms <= 0) return resolve();
-        timerWorker.onmessage = () => resolve();
-        timerWorker.postMessage(ms);
+        const id = ++waitIdCounter;
+        pendingWaits.set(id, resolve);
+        timerWorker.postMessage({ id, ms });
     });
 
     // --- IndexedDB Setup ---
@@ -151,6 +170,33 @@
         }
     }
 
+    const loadBool = (key, defaultBool) => {
+        const val = loadSetting(key, defaultBool ? 'true' : 'false');
+        return val === 'true' || val === 'on'; // 'on' catches the stuck values from the old bug
+    };
+
+    let authorIdMap = {};
+
+    function refreshAuthors() {
+        if (!SHARED_BACKEND_URL || SHARED_BACKEND_URL.includes("YOUR-WORKER-SUBDOMAIN")) return Promise.resolve();
+        return new Promise((resolve) => {
+            const gmXhr = typeof GM !== 'undefined' && GM.xmlHttpRequest ? GM.xmlHttpRequest : GM_xmlhttpRequest;
+            gmXhr({
+                method: "GET",
+                url: `${SHARED_BACKEND_URL}/authors`,
+                headers: { "Accept": "application/json" },
+                onload: (res) => {
+                    if (res.status === 200) {
+                        try { authorIdMap = JSON.parse(res.responseText); } catch(e) {}
+                    }
+                    resolve();
+                },
+                onerror: () => resolve(),
+                ontimeout: () => resolve()
+            });
+        });
+    }
+
     // --- Cloudflare Shared Backend API Calls ---
     function fetchBackendTile(tileX, tileY) {
         return new Promise((resolve) => {
@@ -168,9 +214,21 @@
                     "Accept": "application/json",
                     "Cache-Control": "no-cache" // Extra instruction for local browser cache
                 },
+                // Inside fetchBackendTile, replace the onload function with this:
                 onload: (response) => {
                     if (response.status === 200) {
-                        try { resolve(JSON.parse(response.responseText)); } catch (e) { resolve({}); }
+                        try { 
+                            const raw = JSON.parse(response.responseText);
+                            const translated = {};
+                            for (const [key, val] of Object.entries(raw)) {
+                                let u = val.u;
+                                if (val.a !== undefined) {
+                                    u = authorIdMap[val.a] ? authorIdMap[val.a].n : "Unknown";
+                                }
+                                translated[key] = { u: u, c: val.c };
+                            }
+                            resolve(translated);
+                        } catch (e) { resolve({}); }
                     } else resolve({});
                 },
                 onerror: () => resolve({}),
@@ -179,21 +237,83 @@
         });
     }
 
-    function syncBackendTile(tileX, tileY, batchMap) {
+
+    async function syncBackendTile(tileX, tileY, batchMap) {
+        if (!SHARED_BACKEND_URL || SHARED_BACKEND_URL.includes("YOUR-WORKER-SUBDOMAIN") || Object.keys(batchMap).length === 0) {
+            return;
+        }
+    
+        const subSectors = {};
+        
+        // Group local pixels into 100x100 chunks
+        for (const [key, record] of Object.entries(batchMap)) {
+            const [px, py] = key.split('_').map(Number);
+            const subKey = `${Math.floor(px / 100)}_${Math.floor(py / 100)}`;
+            
+            if (!subSectors[subKey]) subSectors[subKey] = {};
+            subSectors[subKey][key] = record;
+        }
+    
+        // Send each chunk sequentially to prevent network limits
+        for (const [subKey, chunkData] of Object.entries(subSectors)) {
+            await syncBackendTilePortion(tileX, tileY, chunkData);
+            await wait(250); // Give D1 time to process the batch
+        }
+    }
+    
+    function syncBackendTilePortion(tileX, tileY, chunkData, maxRetries = 3) {
         return new Promise((resolve) => {
-            if (!SHARED_BACKEND_URL || SHARED_BACKEND_URL.includes("YOUR-WORKER-SUBDOMAIN") || Object.keys(batchMap).length === 0) {
-                return resolve();
-            }
             const gmXhr = typeof GM !== 'undefined' && GM.xmlHttpRequest ? GM.xmlHttpRequest : GM_xmlhttpRequest;
-            gmXhr({
-                method: "POST",
-                url: `${SHARED_BACKEND_URL}/tile/${tileX}/${tileY}`,
-                headers: { "Content-Type": "application/json" },
-                data: JSON.stringify(batchMap),
-                onload: () => resolve(),
-                onerror: () => resolve(),
-                ontimeout: () => resolve()
-            });
+            
+            const attempt = (currentTry) => {
+                gmXhr({
+                    method: "POST",
+                    url: `${SHARED_BACKEND_URL}/tile/${tileX}/${tileY}`,
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${secretKey}`
+                    },
+                    data: JSON.stringify(chunkData),
+                    onload: (res) => {
+                        if (res.status === 401) {
+                            console.error(`[Wplace Analyzer] Cloud sync error (${tileX}, ${tileY}) - Unauthorized`);
+                            let newKey = prompt('Invalid Sync Key. Please enter a valid key:');
+                            if (newKey) {
+                                secretKey = newKey;
+                                saveSetting('sync-token', newKey);
+                                syncBackendTile(tileX, tileY, chunkData);
+                            }
+                            return;
+                        }
+                        if (res.status >= 400) {
+                            // If D1 is busy (503) or Rate Limited (429), retry with exponential backoff
+                            if ((res.status === 503 || res.status === 429) && currentTry < maxRetries) {
+                                console.warn(`[Wplace Analyzer] D1 busy (HTTP ${res.status}). Retrying chunk (${currentTry}/${maxRetries})...`);
+                                setTimeout(() => attempt(currentTry + 1), 1000 * currentTry);
+                                return;
+                            }
+                            console.error(`[Wplace Analyzer] Cloud sync error (${tileX}, ${tileY}) - HTTP ${res.status}`);
+                        }
+                        resolve();
+                    },
+                    onerror: () => {
+                        if (currentTry < maxRetries) {
+                            setTimeout(() => attempt(currentTry + 1), 1000 * currentTry);
+                            return;
+                        }
+                        resolve();
+                    },
+                    ontimeout: () => {
+                        if (currentTry < maxRetries) {
+                            setTimeout(() => attempt(currentTry + 1), 1000 * currentTry);
+                            return;
+                        }
+                        resolve();
+                    }
+                });
+            };
+            
+            attempt(1);
         });
     }
 
@@ -260,6 +380,158 @@
                 ontimeout: () => resolve({ success: false, status: 408, error: "Timeout" })
             });
         });
+    }
+
+    // --- Polygon Helpers ---
+    function getPolygonBoundingBox(vertices) {
+        if (!vertices || vertices.length === 0) return { minX: 0, maxX: 0, minY: 0, maxY: 0 };
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+        for (const v of vertices) {
+            if (v.x < minX) minX = v.x;
+            if (v.x > maxX) maxX = v.x;
+            if (v.y < minY) minY = v.y;
+            if (v.y > maxY) maxY = v.y;
+        }
+        return { minX, maxX, minY, maxY };
+    }
+    
+    function isPointInPolygon(x, y, vertices) {
+        let inside = false;
+        for (let i = 0, j = vertices.length - 1; i < vertices.length; j = i++) {
+            const xi = vertices[i].x, yi = vertices[i].y;
+            const xj = vertices[j].x, yj = vertices[j].y;
+            const intersect = ((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+            if (intersect) inside = !inside;
+        }
+        return inside;
+    }
+    
+    let visualizerCtx = null;
+    let visBox = { minX: 0, minY: 0 };
+    let minimapZoom = 1;
+    let minimapPanX = 0;
+    let minimapPanY = 0;
+    let isMinimapActive = true;
+    
+    function updateMinimapTransform() {
+        const cvs = document.getElementById('wp-pixel-visualizer');
+        if (cvs) {
+            cvs.style.transformOrigin = '0 0';
+            cvs.style.transform = `translate(${minimapPanX}px, ${minimapPanY}px) scale(${minimapZoom})`;
+        }
+    }
+    
+    function initVisualizer(minX, maxX, minY, maxY) {
+        visBox.minX = minX;
+        visBox.minY = minY;
+        const width = maxX - minX + 1;
+        const height = maxY - minY + 1;
+        
+        // Reset view parameters for a new scan
+        minimapZoom = 1;
+        minimapPanX = 0;
+        minimapPanY = 0;
+        isMinimapActive = true;
+        
+        document.getElementById('wp-minimap-container').style.display = 'block';
+        document.getElementById('wp-minimap-toggle').textContent = 'Hide';
+        
+        const cvs = document.getElementById('wp-pixel-visualizer');
+        cvs.width = width;
+        cvs.height = height;
+        updateMinimapTransform();
+        
+        visualizerCtx = cvs.getContext('2d', { willReadFrequently: true });
+        visualizerCtx.clearRect(0, 0, width, height);
+        
+        visualizerCtx.fillStyle = 'rgba(255, 255, 255, 0.05)';
+        visualizerCtx.fillRect(0, 0, width, height);
+    
+        // Bind viewport interactions (Zoom & Pan) only once
+        const viewport = document.getElementById('wp-minimap-viewport');
+        if (!viewport.dataset.bound) {
+            viewport.dataset.bound = "true";
+    
+            let isDragging = false;
+            let startX = 0, startY = 0;
+    
+            viewport.addEventListener('mousedown', (e) => {
+                isDragging = true;
+                viewport.style.cursor = 'grabbing';
+                startX = e.clientX - minimapPanX;
+                startY = e.clientY - minimapPanY;
+            });
+    
+            window.addEventListener('mousemove', (e) => {
+                if (!isDragging) return;
+                minimapPanX = e.clientX - startX;
+                minimapPanY = e.clientY - startY;
+                updateMinimapTransform();
+            });
+    
+            window.addEventListener('mouseup', () => {
+                isDragging = false;
+                viewport.style.cursor = 'grab';
+            });
+    
+            viewport.addEventListener('wheel', (e) => {
+                e.preventDefault();
+            
+                const zoomFactor = 1.15;
+            
+                const rect = viewport.getBoundingClientRect();
+                const centerX = rect.width / 2;
+                const centerY = rect.height / 2;
+            
+                const oldZoom = minimapZoom;
+            
+                if (e.deltaY < 0) {
+                    minimapZoom *= zoomFactor;
+                } else {
+                    minimapZoom /= zoomFactor;
+                    if (minimapZoom < 0.1) minimapZoom = 0.1;
+                }
+            
+                // Keep the center of the viewport fixed while zooming
+                minimapPanX = centerX - (centerX - minimapPanX) * (minimapZoom / oldZoom);
+                minimapPanY = centerY - (centerY - minimapPanY) * (minimapZoom / oldZoom);
+            
+                updateMinimapTransform();
+            }, { passive: false });
+    
+            // Toggle Hide/Show performance switch
+            document.getElementById('wp-minimap-toggle').addEventListener('click', () => {
+                isMinimapActive = !isMinimapActive;
+                const toggleBtn = document.getElementById('wp-minimap-toggle');
+                const cvsElem = document.getElementById('wp-pixel-visualizer');
+                if (isMinimapActive) {
+                    cvsElem.style.display = 'block';
+                    toggleBtn.textContent = 'Hide';
+                } else {
+                    cvsElem.style.display = 'none'; // Stops rendering updates & hidden from DOM view
+                    toggleBtn.textContent = 'Show';
+                }
+            });
+        }
+    }
+    
+    function drawVisualizerPixel(x, y, status) {
+        // 0 -> To be fetched (white)
+        // 1 -> fetched color (green)
+        // 2 -> fetched transparent (pink/purple)
+        // 3 -> cached (blue)
+        if (!isMinimapActive || !visualizerCtx) return; // Skips updates completely when hidden for performance
+        
+        const colorMap = {
+            0: '#ffffff', // White
+            1: '#00ff00', // Green
+            2: '#ff00ff', // Pink/Purple
+            3: '#0000ff'  // Blue
+        };
+        
+        const color = colorMap[status] || '#ff0000'; // Fallback to red if unknown
+        visualizerCtx.fillStyle = color;
+        visualizerCtx.fillRect(x - visBox.minX, y - visBox.minY, 1, 1);
     }
 
     // --- Passive Click Harvesting ---
@@ -329,12 +601,18 @@
                         const clone = response.clone();
                         clone.json().then(data => {
                             const username = data?.paintedBy?.name || "Blank / Unknown";
+                            const uid = data?.paintedBy?.id || null;
+                            const aid = data?.paintedBy?.allianceId || null;
+                            const an = data?.paintedBy?.allianceName || null;
                             window.dispatchEvent(new CustomEvent('wp-pixel-harvested', {
                                 detail: { 
                                     x: globalX, y: globalY, 
                                     tileX: parseInt(match[1], 10), tileY: parseInt(match[2], 10), 
                                     pixelX: parseInt(match[3], 10), pixelY: parseInt(match[4], 10), 
-                                    username: username 
+                                    username: username,
+                                    uid: uid,
+                                    aid: aid,
+                                    an: an
                                 }
                             }));
                         }).catch(() => {});
@@ -350,6 +628,7 @@
 
     const PALETTE = {
         // === FREE COLORS (Indices 0 - 30) ===
+        '-1': -1,     // transparent
         0: 0x000000,  // Black
         1: 0x3C3C3C,  // Dark Gray
         2: 0x787878,  // Gray
@@ -442,6 +721,9 @@
                     pixelX: pixelX, 
                     pixelY: pixelY, 
                     username: localUsername,
+                    uid: localUserUid,
+                    aid: localUserAid,
+                    an: localUserAn,
                     exactColor: exactColor,
                 }
             }));
@@ -456,7 +738,7 @@
     let syncTimeout = null;
 
     window.addEventListener('wp-pixel-harvested', async (e) => {
-        const { x, y, tileX, tileY, pixelX, pixelY, username, exactColor } = e.detail;
+        const { x, y, tileX, tileY, pixelX, pixelY, username, uid, aid, an, exactColor } = e.detail;
         const cacheKey = `${x}_${y}`;
         const localKey = `${pixelX}_${pixelY}`;
         const existing = pixelCache[cacheKey];
@@ -467,7 +749,7 @@
         }
     
         const color = exactColor ?? existing?.c ?? await getHarvestedPixelColor(tileX, tileY, pixelX, pixelY);
-        const record = { u: username, c: color };
+        const record = { u: username, uid: uid, aid: aid, an: an, c: color };
         pixelCache[cacheKey] = record;
     
         if (db) {
@@ -486,32 +768,64 @@
         outboundSyncQueue[sectorKey].data[localKey] = record;
     
         clearTimeout(syncTimeout);
-        syncTimeout = setTimeout(() => {
-            for (const bucket of Object.values(outboundSyncQueue)) {
-                syncBackendTile(bucket.tx, bucket.ty, bucket.data);
+        syncTimeout = setTimeout(async () => {
+            // Copy the queue and reset it immediately to catch new incoming clicks
+            const buckets = Object.values(outboundSyncQueue);
+            outboundSyncQueue = {}; 
+        
+            // Await each bucket to prevent concurrent D1 database locks
+            for (const bucket of buckets) {
+                await syncBackendTile(bucket.tx, bucket.ty, bucket.data);
             }
-            outboundSyncQueue = {}; // Reset queue after sending
-        }, 1500); // Waits 1.5 seconds after your last paint to send the batch
+        }, 5000);
     });
 
+    function drawPolygonSVG(vertices, isClosed = false) {
+        let svg = document.getElementById('wp-svg-overlay');
+        if (!svg) {
+            svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+            svg.id = 'wp-svg-overlay';
+            Object.assign(svg.style, {
+                pointerEvents: 'none', position: 'absolute', top: '0', left: '0',
+                width: '100%', height: '100%', zIndex: '9999', overflow: 'visible'
+            });
+            const polyline = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+            polyline.id = 'wp-svg-polyline';
+            polyline.setAttribute('stroke', '#00ff00');
+            polyline.setAttribute('stroke-width', '2');
+            polyline.setAttribute('fill', 'rgba(0, 255, 0, 0.2)');
+            svg.appendChild(polyline);
+            document.body.appendChild(svg);
+        }
+        
+        const polyline = document.getElementById('wp-svg-polyline');
+        let pointsString = vertices.map(v => `${v.x},${v.y}`).join(' ');
+        if (isClosed && vertices.length >= 3) pointsString += ` ${vertices[0].x},${vertices[0].y}`;
+        polyline.setAttribute('points', pointsString);
+    
+        // Clear old vertices and redraw
+        svg.querySelectorAll('.wp-vertex-circle').forEach(c => c.remove());
+        vertices.forEach(v => {
+            const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+            circle.setAttribute('class', 'wp-vertex-circle');
+            circle.setAttribute('cx', v.x);
+            circle.setAttribute('cy', v.y);
+            circle.setAttribute('r', '4');
+            circle.setAttribute('fill', '#ffffff');
+            circle.setAttribute('stroke', '#00ff00');
+            circle.setAttribute('stroke-width', '2');
+            svg.appendChild(circle);
+        });
+    }
+
     function handleCanvasClick(x, y) {
-        const statusDiv = document.getElementById('wp-status');
         if (selectionStep === 1) {
-            document.getElementById('wp-startx').value = x;
-            document.getElementById('wp-starty').value = y;
-            saveSetting('startx', x);
-            saveSetting('starty', y);
-            selectionStep = 2;
-            statusDiv.innerHTML = `<span style="color: #55ff55">Corner 1 set at (${x}, ${y}).</span><br>Click opposite corner...`;
-        } else if (selectionStep === 2) {
-            document.getElementById('wp-endx').value = x;
-            document.getElementById('wp-endy').value = y;
-            saveSetting('endx', x);
-            saveSetting('endy', y);
-            selectionStep = 0;
-            statusDiv.innerHTML = `<span style="color: #55ff55">Area selected!</span><br>Ready to analyze.`;
-            document.getElementById('wp-select-btn').style.backgroundColor = '#ddd';
-            document.getElementById('wp-select-btn').textContent = 'Select Area';
+            polygonVertices.push({ x, y });
+            saveSetting('polygon-vertices', JSON.stringify(polygonVertices));
+            document.getElementById('wp-vertices-display').textContent = `Vertices: ${polygonVertices.length}`;
+            document.getElementById('wp-status').innerHTML = `<span style="color: #55ff55">Vertex added at (${x}, ${y}).</span>`;
+            
+            drawPolygonSVG(polygonVertices);
         }
     }
 
@@ -532,14 +846,11 @@
     </div>
 
     <div id="wp-panel-content">
-        <button id="wp-select-btn" style="width: 100%; padding: 5px; margin-bottom: 6px; cursor: pointer; color: black; background: #ddd; border: none; border-radius: 4px; font-size: 11px;" disabled>Loading Cache...</button>
-
-        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-bottom: 6px;">
-            <input type="number" id="wp-startx" placeholder="Start X" value="" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
-            <input type="number" id="wp-starty" placeholder="Start Y" value="" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
-            <input type="number" id="wp-endx" placeholder="End X" value="" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
-            <input type="number" id="wp-endy" placeholder="End Y" value="" style="width: 100%; padding: 3px; box-sizing: border-box; font-size: 11px;">
+        <div style="display: flex; gap: 4px; margin-bottom: 6px;">
+            <button id="wp-select-btn" style="flex: 1; padding: 5px; cursor: pointer; color: black; background: #ddd; border: none; border-radius: 4px; font-size: 11px;" disabled>Loading Cache...</button>
+            <button id="wp-close-btn" style="flex: 1; padding: 5px; cursor: pointer; color: black; background: #ddd; border: none; border-radius: 4px; font-size: 11px;" disabled>Close Shape</button>
         </div>
+        <div id="wp-vertices-display" style="text-align: center; font-size: 11px; margin-bottom: 6px;">Vertices: 0</div>
 
         <details style="background: rgba(255,255,255,0.05); padding: 6px; border-radius: 4px; margin-bottom: 6px;">
             <summary style="font-weight: bold; color: #aaa; font-size: 10px; cursor: pointer; user-select: none;">Cadence & Auto-Tuning</summary>
@@ -572,8 +883,20 @@
 
         <div style="margin-bottom: 6px; font-size: 10px;">
             <label style="cursor: pointer; display: block; margin-bottom: 2px;"><input type="checkbox" id="wp-use-diff" checked> <b>Tile Diffing</b></label>
-            <label style="cursor: pointer; display: block;"><input type="checkbox" id="wp-use-cloud" checked> <b>Cloud Sync</b></label>
+            <label style="cursor: pointer; display: block; margin-bottom: 2px;"><input type="checkbox" id="wp-use-cloud-download" checked> <b>Cloud Sync (Download)</b></label>
+            <label style="cursor: pointer; display: block; margin-bottom: 2px;"><input type="checkbox" id="wp-use-cloud-upload"> <b>Cloud Sync (Upload)</b></label>
+            <label style="cursor: pointer; display: block;"><input type="checkbox" id="wp-use-expand"> <b>Auto-Expand (Current Tiles)</b></label>
             <button id="wp-clear-cache" style="margin-top: 4px; padding: 3px 6px; background: #555; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 10px;" disabled>Clear Cache</button>
+        </div>
+
+        <div id="wp-minimap-container" style="display:none; margin-bottom: 6px; padding: 4px; border: 1px solid #444; border-radius: 4px; background: rgba(0,0,0,0.3);">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; font-size: 9px; color: #aaa;">
+                <span>Minimap (Scroll to Zoom, Drag to Pan)</span>
+                <button id="wp-minimap-toggle" style="background: #444; border: none; color: white; font-size: 9px; cursor: pointer; padding: 1px 4px; border-radius: 2px;">Hide</button>
+            </div>
+            <div id="wp-minimap-viewport" style="width: 100%; height: 150px; overflow: hidden; position: relative; cursor: grab; background: #111; border-radius: 2px;">
+                <canvas id="wp-pixel-visualizer" style="position: absolute; top: 0; left: 0; image-rendering: pixelated; transform-origin: 0 0; padding-left: 0; padding-right: 0; margin-left: auto; margin-right: auto; display: block; width: 100%;"></canvas>
+            </div>
         </div>
 
         <button id="wp-analyze-btn" style="width: 100%; padding: 6px; cursor: pointer; border: none; border-radius: 4px; font-size: 11px; font-weight: bold;" disabled>Start Analysis</button>
@@ -596,7 +919,8 @@
     try {
         await initDB();
         await loadCacheToRAM();
-        fetchLocalUsername();
+        fetchLocalUserInfo();
+        refreshAuthors();
 
         // --- UI Setup ---
         document.getElementById('wp-clear-cache').textContent = `Clear Cache (${Object.keys(pixelCache).length})`;
@@ -606,10 +930,25 @@
         document.getElementById('wp-clear-cache').disabled = false;
         document.getElementById('wp-status').textContent = 'Ready.';
 
-        document.getElementById('wp-startx').value = loadSetting('startx', '');
-        document.getElementById('wp-starty').value = loadSetting('starty', '');
-        document.getElementById('wp-endx').value = loadSetting('endx', '');
-        document.getElementById('wp-endy').value = loadSetting('endy', '');
+        // --- Load Cached Vertices ---
+        try {
+            const savedStr = loadSetting('polygon-vertices', '[]');
+            const parsed = JSON.parse(savedStr);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+                polygonVertices = parsed;
+                document.getElementById('wp-vertices-display').textContent = `Vertices: ${polygonVertices.length}`;
+                
+                const isClosed = polygonVertices.length >= 3;
+                drawPolygonSVG(polygonVertices, isClosed);
+                
+                if (isClosed) {
+                    document.getElementById('wp-analyze-btn').disabled = false;
+                    document.getElementById('wp-status').innerHTML = `<span style="color: #55ff55">Loaded closed shape!</span> Ready to analyze.`;
+                }
+            }
+        } catch(e) {
+            polygonVertices = [];
+        }
 
         document.getElementById('wp-delay').value = loadSetting('delay', '800');
         document.getElementById('wp-min-floor').value = loadSetting('min-floor', '600');
@@ -617,12 +956,23 @@
         document.getElementById('wp-penalty-ms').value = loadSetting('penalty-ms', '100');
         document.getElementById('wp-step-down').value = loadSetting('step-down', '10');
         document.getElementById('wp-streak-reqs').value = loadSetting('streak-reqs', '30');
+        document.getElementById('wp-use-cloud-upload').checked = loadBool('use-cloud-upload', false);
+        document.getElementById('wp-use-cloud-download').checked = loadBool('use-cloud-download', true);
+        document.getElementById('wp-use-diff').checked = loadBool('use-diff', true);
+        document.getElementById('wp-use-expand').checked = loadBool('use-expand', false);
 
         // --- Save Inputs Automatically on Change ---
-        const inputIds = ['wp-startx', 'wp-starty', 'wp-endx', 'wp-endy', 'wp-delay', 'wp-min-floor', 'wp-pause-sec', 'wp-penalty-ms', 'wp-step-down', 'wp-streak-reqs'];
+        const inputIds = ['wp-delay', 'wp-min-floor', 'wp-pause-sec', 'wp-penalty-ms', 'wp-step-down', 'wp-streak-reqs', 'wp-use-cloud-upload', 'wp-use-cloud-download', 'wp-use-diff', 'wp-use-expand'];
+
         inputIds.forEach(id => {
             const el = document.getElementById(id);
-            el.addEventListener('input', () => saveSetting(id.replace('wp-', ''), el.value));
+            const eventType = el.type === 'checkbox' ? 'change' : 'input';
+            
+            el.addEventListener(eventType, () => {
+                // Force explicit "true" or "false" strings for checkboxes
+                const val = el.type === 'checkbox' ? (el.checked ? 'true' : 'false') : el.value;
+                saveSetting(id.replace('wp-', ''), val);
+            });
         });
     } catch (e) {
         document.getElementById('wp-status').innerHTML = `<span style='color:red'>Failed to init Database.</span>`;
@@ -638,17 +988,48 @@
 
     document.getElementById('wp-select-btn').addEventListener('click', (e) => {
         if (isScanning) return;
+        // const existingVis = document.getElementById('wp-pixel-visualizer');
+        // if (existingVis) existingVis.remove();
         if (selectionStep === 0) {
             selectionStep = 1;
+            polygonVertices = [];
+            document.getElementById('wp-vertices-display').textContent = `Vertices: 0`;
+            const existingSvg = document.getElementById('wp-svg-overlay');
+            if (existingSvg) existingSvg.remove();
+            
             e.target.style.backgroundColor = '#ffffaa';
             e.target.textContent = 'Cancel Selection';
-            document.getElementById('wp-status').innerHTML = "Click the <b>first corner</b> of your rectangle in-game...";
+            document.getElementById('wp-close-btn').disabled = false;
+            document.getElementById('wp-analyze-btn').disabled = true;
+            document.getElementById('wp-minimap-container').style.display = 'none';
+            document.getElementById('wp-status').innerHTML = "Click points on the canvas to draw a shape...";
         } else {
             selectionStep = 0;
+            document.getElementById('wp-minimap-container').style.display = 'none';
+            const existingSvg = document.getElementById('wp-svg-overlay');
+            if (existingSvg) existingSvg.remove();
+            
             e.target.style.backgroundColor = '';
             e.target.textContent = 'Select Area';
+            document.getElementById('wp-close-btn').disabled = true;
             document.getElementById('wp-status').innerHTML = "Selection cancelled.";
         }
+    });
+
+    document.getElementById('wp-close-btn').addEventListener('click', (e) => {
+        if (polygonVertices.length < 3) {
+            document.getElementById('wp-status').innerHTML = "<span style='color:#ff5555'>Need at least 3 vertices!</span>";
+            return;
+        }
+        selectionStep = 0;
+        
+        drawPolygonSVG(polygonVertices, true); // Seal it visually
+        
+        document.getElementById('wp-select-btn').style.backgroundColor = '';
+        document.getElementById('wp-select-btn').textContent = 'Select Area';
+        e.target.disabled = true;
+        document.getElementById('wp-analyze-btn').disabled = false;
+        document.getElementById('wp-status').innerHTML = `<span style="color: #55ff55">Shape closed!</span> Ready to analyze.`;
     });
 
     // --- Main Scan Logic with Cloud Sync & Tile Diffing ---
@@ -663,16 +1044,97 @@
             return;
         }
 
-        const useDiff = document.getElementById('wp-use-diff').checked;
-        const useCloud = document.getElementById('wp-use-cloud').checked;
-        const startX = parseInt(document.getElementById('wp-startx').value, 10);
-        const startY = parseInt(document.getElementById('wp-starty').value, 10);
-        const endX = parseInt(document.getElementById('wp-endx').value, 10);
-        const endY = parseInt(document.getElementById('wp-endy').value, 10);
-
-        if (isNaN(startX) || isNaN(startY) || isNaN(endX) || isNaN(endY)) {
-            statusDiv.innerHTML = "<span style='color: #ff5555'>Error: Need coordinates!</span>";
+        if (polygonVertices.length < 3) {
+            statusDiv.innerHTML = "<span style='color: #ff5555'>Error: No polygon defined!</span>";
             return;
+        }
+
+        const useDiff = document.getElementById('wp-use-diff').checked;
+        const useCloudDownload = document.getElementById('wp-use-cloud-download').checked;
+        const useCloudUpload = document.getElementById('wp-use-cloud-upload').checked;
+        const useExpand = document.getElementById('wp-use-expand').checked;
+
+        if (useCloudUpload && !secretKey) {
+            statusDiv.innerHTML = "<span style='color: #ff5555'>Error: No sync key defined!</span>";
+            let newKey = prompt('Invalid Sync Key. Please enter a valid key:');
+            if (newKey) {
+                secretKey = newKey;
+                saveSetting('sync-token', newKey);
+            } else {
+                statusDiv.innerHTML = "<span style='color: #ff5555'>Error: No sync key defined! Please disable Cloud Sync.</span>";
+                return;
+            }
+        }
+
+        const visitedPixels = new Set();
+        const expansionQueue = [];
+        const activeVein = []; // for when a vein of cached pixels is together
+        let taskIndex = 0;
+        let expansionIndex = 0;
+
+        // Change signature to accept a target array, defaulting to expansionQueue
+        function checkNeighbors(px, py, targetQueue = expansionQueue) {
+            const neighbors = [
+                { nx: px, ny: py - 1 }, // Up
+                { nx: px, ny: py + 1 }, // Down
+                { nx: px - 1, ny: py }, // Left
+                { nx: px + 1, ny: py }, // Right
+                { nx: px - 1, ny: py - 1 }, // Up-Left
+                { nx: px + 1, ny: py - 1 }, // Up-Right
+                { nx: px - 1, ny: py + 1 }, // Down-Left
+                { nx: px + 1, ny: py + 1 }, // Down-Right
+                // tolerance
+                { nx: px - 2, ny: py }, // Left-Left
+                { nx: px + 2, ny: py }, // Right-Right
+                { nx: px, ny: py - 2 }, // Up-Up
+                { nx: px, ny: py + 2 }, // Down-Down
+
+                // randomly generated
+                // { nx: px + Math.floor(Math.random() * 10) - 5, ny: py + Math.floor(Math.random() * 10) - 5 },
+            ];
+            for (const { nx, ny } of neighbors) {
+                const key = `${nx}_${ny}`;
+
+                if (visitedPixels.has(key)) {
+                    // Soft-promote: Push a duplicate into activeVein if it's part of a mid-scan line
+                    if (targetQueue === activeVein && midScanHarvested.has(key)) {
+                        const coords = getCoords(nx, ny);
+                        activeVein.push({ 
+                            x: nx, y: ny, 
+                            tileX: coords.tileX, tileY: coords.tileY, 
+                            pixelX: coords.pixelX, pixelY: coords.pixelY 
+                        });
+                    }
+                    continue;
+                }
+
+                if (isPointInPolygon(nx, ny, polygonVertices)) continue;
+                
+                const coords = getCoords(nx, ny);
+                if (!tileDataMap.has(`${coords.tileX}_${coords.tileY}`)) continue;
+
+                visitedPixels.add(key);
+                
+                // Push to whatever queue was passed in
+                targetQueue.push({ 
+                    x: nx, y: ny, 
+                    tileX: coords.tileX, tileY: coords.tileY, 
+                    pixelX: coords.pixelX, pixelY: coords.pixelY 
+                });
+                drawVisualizerPixel(nx, ny, 0);
+            }
+        }
+        
+        const { minX, maxX, minY, maxY } = getPolygonBoundingBox(polygonVertices);
+
+        const pad = useExpand ? (TILE_SIZE * 2) : 0;
+        initVisualizer(minX - pad, maxX + pad, minY - pad, maxY + pad);
+        
+        let totalPixels = 0;
+        for (let y = minY; y <= maxY; y++) {
+            for (let x = minX; x <= maxX; x++) {
+                if (isPointInPolygon(x, y, polygonVertices)) totalPixels++;
+            }
         }
 
         let targetInterval = Math.max(0, parseInt(document.getElementById('wp-delay').value, 10) || 0);
@@ -682,12 +1144,6 @@
         const stepDownMs = Math.max(0, parseInt(document.getElementById('wp-step-down').value, 10) || 0);
         const streakReqs = Math.max(1, parseInt(document.getElementById('wp-streak-reqs').value, 10) || 30);
 
-        const minX = Math.min(startX, endX);
-        const maxX = Math.max(startX, endX);
-        const minY = Math.min(startY, endY);
-        const maxY = Math.max(startY, endY);
-        const totalPixels = (maxX - minX + 1) * (maxY - minY + 1);
-
         isScanning = true;
         midScanHarvested.clear();
         btn.textContent = 'Stop Analysis';
@@ -696,6 +1152,7 @@
 
         const counts = {};
         let newPixelsToSave = {};
+        let cloudBatchQueue = {};
         const tileDataMap = new Map();
 
         const minTileX = Math.floor(minX / TILE_SIZE);
@@ -711,8 +1168,10 @@
         }
 
         // 1. Ingest & Reconcile Shared Cloud Backend
-        if (useCloud) {
+        if (useCloudDownload) {
             statusDiv.innerHTML = `Syncing cloud cache for ${intersectingTiles.length} sector(s)...`;
+            
+            await refreshAuthors();
             
             // --- PRE-COMPUTE: Bucket only the relevant local pixels to avoid 1,000,000 grid iterations ---
             const localTiles = {};
@@ -806,7 +1265,11 @@
 
         for (let y = minY; y <= maxY; y++) {
             for (let x = minX; x <= maxX; x++) {
+                if (!isPointInPolygon(x, y, polygonVertices)) continue;
+
                 const cacheKey = `${x}_${y}`;
+                visitedPixels.add(cacheKey); // Mark core polygon pixels as visited
+                
                 const cached = pixelCache[cacheKey];
                 const { tileX, tileY, pixelX, pixelY } = getCoords(x, y);
                 const tileKey = `${tileX}_${tileY}`;
@@ -820,6 +1283,10 @@
                 if (useDiff && cached && cached.c !== null && currentColor !== null && cached.c === currentColor) {
                     counts[cached.u] = (counts[cached.u] || 0) + 1;
                     instantMatches++;
+
+                    const isColor = currentColor !== -1 && currentColor !== null;
+                    drawVisualizerPixel(x, y, isColor ? 1 : 2);
+                    if (useExpand && currentColor !== -1 && currentColor !== null) checkNeighbors(x, y);
                 } else {
                     fetchTasks.push({ x, y, tileX, tileY, pixelX, pixelY, currentColor });
                 }
@@ -836,102 +1303,166 @@
 
         statusDiv.innerHTML = `Diff complete: <b>${instantMatches}</b> unchanged, <b>${fetchTasks.length}</b> to query.<br>`;
 
-        // 4. Query Only Modified / Missing Pixels
-        for (const task of fetchTasks) {
-            if (!isScanning) break;
+        const scannedKeys = new Set();
 
-            const { x, y, tileX, tileY, pixelX, pixelY, currentColor } = task;
+        // 4. Query Only Modified / Missing Pixels
+        while ((taskIndex < fetchTasks.length || activeVein.length > 0 || (useExpand && expansionIndex < expansionQueue.length)) && isScanning) {
+            let task, isExpansionTask = false;
+            
+            // Prioritize fetchTasks array, then activeVein. Fall back to expansionQueue.
+            if (taskIndex < fetchTasks.length) {
+                task = fetchTasks[taskIndex++];
+            } else if (activeVein.length > 0) {
+                task = activeVein.pop(); 
+                isExpansionTask = true;
+            } else {
+                const remaining = expansionQueue.length - expansionIndex;
+
+                // Adjust this exponent to control the drop-off steepness:
+                const skewFactor = 2;
+                
+                // Math.pow() skews the random number toward 0 (smaller offsets)
+                const randOffset = Math.floor(Math.pow(Math.random(), skewFactor) * remaining);
+                const targetIdx = expansionIndex + randOffset;
+                
+                // Swap the random item to our current index position
+                const temp = expansionQueue[expansionIndex];
+                expansionQueue[expansionIndex] = expansionQueue[targetIdx];
+                expansionQueue[targetIdx] = temp;
+                
+                task = expansionQueue[expansionIndex++];
+                isExpansionTask = true;
+            }
+        
+            const { x, y, tileX, tileY, pixelX, pixelY } = task;
             const cacheKey = `${x}_${y}`;
 
-            // Skip if the passive harvester grabbed it while we were waiting
+            if (scannedKeys.has(cacheKey)) {
+                if (!isExpansionTask) uncachedRemaining--; 
+                continue;
+            }
+            scannedKeys.add(cacheKey);
+            
+            let currentColor = task.currentColor;
+        
             if (midScanHarvested.has(cacheKey)) {
                 processed++;
-                uncachedRemaining--;
+                if (!isExpansionTask) uncachedRemaining--;
+                checkNeighbors(x, y, activeVein); // instead of reading it from the cache and wasting more resources, just check the neighbors anyway, since this if block will rarely be hit
+                drawVisualizerPixel(x, y, 3);
                 continue; 
             }
 
+
+        
+            // Inline Diff Check for discovered Expansion Pixels
+            if (isExpansionTask) {
+                const cached = pixelCache[cacheKey];
+                const tileData = tileDataMap.get(`${tileX}_${tileY}`);
+                if (tileData) currentColor = getTilePixelColor(tileData, pixelX, pixelY);
+        
+                if (useDiff && cached && cached.c !== null && currentColor !== null && cached.c === currentColor) {
+                    counts[cached.u] = (counts[cached.u] || 0) + 1;
+                    processed++;
+                    if (currentColor !== -1 && currentColor !== null) checkNeighbors(x, y, activeVein);
+
+                    drawVisualizerPixel(x, y, 3);
+                    continue; 
+                }
+                uncachedRemaining++; // Flagged for network fetch, add to remaining
+            }
+        
             let resolved = false;
             while (!resolved && isScanning) {
                 const cycleStartTime = performance.now();
                 const res = await fetchPixelData(tileX, tileY, pixelX, pixelY);
-
+        
                 if (res.success) {
                     const username = res.data?.paintedBy?.name || "Blank / Unknown";
                     counts[username] = (counts[username] || 0) + 1;
-
+        
                     const record = { u: username, c: currentColor };
                     pixelCache[cacheKey] = record;
                     newPixelsToSave[cacheKey] = record;
+                    
+                    if (useCloudDownload) {
+                        const sectorKey = `${tileX}_${tileY}`;
+                        if (!cloudBatchQueue[sectorKey]) cloudBatchQueue[sectorKey] = { tx: tileX, ty: tileY, data: {} };
+                        cloudBatchQueue[sectorKey].data[`${pixelX}_${pixelY}`] = record;
+                    }
 
                     processed++;
                     fetched++;
                     uncachedRemaining--;
 
+                    const isColor = currentColor !== -1 && currentColor !== null;
+
+                    if (useExpand && isColor) checkNeighbors(x, y);
+        
                     consecutiveSuccesses++;
                     if (stepDownMs > 0 && consecutiveSuccesses >= streakReqs && targetInterval > minFloorInterval) {
                         targetInterval = Math.max(minFloorInterval, targetInterval - stepDownMs);
                         document.getElementById('wp-delay').value = targetInterval;
                         consecutiveSuccesses = 0;
                     }
-
-                    // Save local DB batch
+        
                     if (Object.keys(newPixelsToSave).length >= 50) {
                         await saveBatchToDB(newPixelsToSave);
                         newPixelsToSave = {};
                         document.getElementById('wp-clear-cache').textContent = `Clear Cache (${Object.keys(pixelCache).length})`;
-                    }
 
+                        // Periodic cloud flush so stopping the script never drops progress
+                        if (useCloudDownload && Object.keys(cloudBatchQueue).length > 0) {
+                            const buckets = Object.values(cloudBatchQueue);
+                            cloudBatchQueue = {};
+                            for (const bucket of buckets) {
+                                await syncBackendTile(bucket.tx, bucket.ty, bucket.data);
+                            }
+                        }
+                    }
+        
                     resolved = true;
-
-                    const fetchDuration = performance.now() - cycleStartTime; // now includes the amount of time
+        
+                    const fetchDuration = performance.now() - cycleStartTime;
                     const remainingSleep = Math.max(0, targetInterval - fetchDuration);
-                    if (fetchTasks.length > 0 && isScanning && remainingSleep > 0) {
-                        await wait(remainingSleep);
-                    }
-
+                    
+                    const hasTasksRemaining = taskIndex < fetchTasks.length || (useExpand && expansionIndex < expansionQueue.length);
+                    if (hasTasksRemaining && isScanning && remainingSleep > 0) await wait(remainingSleep);
+        
                     const actualCycleDuration = performance.now() - cycleStartTime;
-
                     if (hasMeasuredFirst) {
                         const diff = actualCycleDuration - estimatedMsPerPixel;
-                    
-                        const weight =
-                            actualCycleDuration < estimatedMsPerPixel
-                                ? 0.8  // react quickly when things get faster
-                                : 0.05; // smooth increases
-                    
+                        const weight = actualCycleDuration < estimatedMsPerPixel ? 0.8 : 0.05;
                         estimatedMsPerPixel += diff * weight;
                     } else {
                         estimatedMsPerPixel = actualCycleDuration;
                         hasMeasuredFirst = true;
                     }
-
-                    const pct = ((processed / totalPixels) * 100).toFixed(1);
-                    const pctFetched = ((fetched / totalPixels) * 100).toFixed(1);
+        
+                    const dynamicTotal = totalPixels + expansionQueue.length + activeVein.length;
+                    const pct = ((processed / dynamicTotal) * 100).toFixed(1);
+                    const pctFetched = ((fetched / dynamicTotal) * 100).toFixed(1);
                     const etaStr = formatETA(Math.round((uncachedRemaining * estimatedMsPerPixel) / 1000));
-
-                    statusDiv.innerHTML = `[${processed}/${totalPixels} • <span style="color:#55ff55">${pct}%</span> • <span style="color:#55d2ff">${pctFetched}%</span>]<br>` +
+                    
+                    statusDiv.innerHTML = `[${processed}/${dynamicTotal}${isExpansionTask ? ' (Expanding)' : ''} • <span style="color:#55ff55">${pct}%</span> • <span style="color:#55d2ff">${pctFetched}%</span>]<br>` +
                                           `Target: <b>${targetInterval}ms</b> (Floor: <b>${minFloorInterval}ms</b>)<br>` +
                                           `Avg: <b>${Math.round(estimatedMsPerPixel)}ms</b> • ETA: <b>${etaStr}</b><br>` +
                                           `Scanned: ${username}`;
-
+                    drawVisualizerPixel(x, y, isColor ? 1 : 2);
+        
                 } else if (res.status === 429) {
                     consecutiveSuccesses = 0;
-
                     const learnedFloor = targetInterval + Math.max(10, stepDownMs);
                     if (learnedFloor > minFloorInterval) {
                         minFloorInterval = learnedFloor;
                         document.getElementById('wp-min-floor').value = minFloorInterval;
                     }
-
                     targetInterval += penaltyMs;
                     document.getElementById('wp-delay').value = targetInterval;
-
+        
                     statusDiv.innerHTML = `<span style="color:#ffcc00"><b>Rate Limited (429)!</b></span><br>` +
                                           `Floor: <b>${minFloorInterval}ms</b><br>` +
                                           `Pausing ${pauseSec}s... Target: <b>${targetInterval}ms</b>`;
-                    console.warn(`Rate Limited (429)! Pausing ${pauseSec}s... Target: ${targetInterval}ms`);
-                    console.log(`Avg: ${estimatedMsPerPixel}ms, min: ${minFloorInterval}ms, cur: ${targetInterval}ms`);
-                    console.log(`Processed: ${processed}, Remaining: ${uncachedRemaining}, Fetched: ${fetched}`);
                     await wait(pauseSec * 1000);
                 } else {
                     statusDiv.innerHTML = `<span style="color:#ff5555">Error ${res.status || 'Network'}. Retrying in 2s...</span>`;
@@ -947,20 +1478,12 @@
             document.getElementById('wp-clear-cache').textContent = `Clear Cache (${Object.keys(pixelCache).length})`;
         }
 
-        if (useCloud && fetchTasks.length > 0) {
+        // Flush remaining expansion and polygon discoveries to Cloudflare
+        if (useCloudDownload && Object.keys(cloudBatchQueue).length > 0) {
             statusDiv.innerHTML = `Syncing discoveries to cloud...`;
-            const cloudSyncBuckets = {};
-            for (const task of fetchTasks) {
-                const { x, y, tileX, tileY, pixelX, pixelY, currentColor } = task;
-                const cached = pixelCache[`${x}_${y}`];
-                if (cached) {
-                    const sectorKey = `${tileX}_${tileY}`;
-                    if (!cloudSyncBuckets[sectorKey]) cloudSyncBuckets[sectorKey] = { tx: tileX, ty: tileY, data: {} };
-                    cloudSyncBuckets[sectorKey].data[`${pixelX}_${pixelY}`] = cached;
-                }
-            }
-
-            for (const bucket of Object.values(cloudSyncBuckets)) {
+            const buckets = Object.values(cloudBatchQueue);
+            cloudBatchQueue = {};
+            for (const bucket of buckets) {
                 await syncBackendTile(bucket.tx, bucket.ty, bucket.data);
             }
         }
