@@ -1,6 +1,6 @@
 # Wplace Pixel Analyzer
 
-A high-performance, collaborative pixel art analyzer and leaderboard scanner for [wplace.live](https://wplace.live). Efficiently tallies pixel ownership across custom rectangular regions using visual tile diffing, multi-tiered cloud caching, and dynamic rate-limit auto-tuning.
+A high-performance, collaborative pixel art analyzer and leaderboard scanner for [wplace.live](https://wplace.live). Efficiently tallies pixel ownership across custom regions using visual tile diffing, multi-tiered cloud caching, and dynamic rate-limit auto-tuning.
 
 ---
 
@@ -35,17 +35,19 @@ A high-performance, collaborative pixel art analyzer and leaderboard scanner for
 ## How to Use
 
 1. **Select an Area:**
-* Click **Select Area** and click two opposite corners of your target rectangle directly on the canvas, **or**
-* Manually enter the start and end coordinates into the **Start X/Y** and **End X/Y** input fields.
+    * Click **Select Area** and click on at least 3 pixels on the canvas, in order to create a polygon.
+    * (the edges of the polygon will follow the order of the vertices)
 
 
 2. **Configure Scan Mode:**
-* **Tile Diffing (Recommended):** Compares tile images to skip queries for static pixels.
-* **Cloud Sync:** Synchronizes discoveries with the shared Cloudflare D1 database.
+    * **Tile Diffing (Recommended):** Compares tile images to skip queries for static pixels.
+    * **Cloud Sync:** Synchronizes discoveries with the shared Cloudflare D1 database.
+        * _Download_: available to all users
+        * _Upload_: available to trusted users
 
 
 3. **Run Analysis:**
-* Click **Start Analysis**. The script will diff the area, query any missing pixels, and render a final breakdown of contributors sorted by pixel count.
+    * Click **Start Analysis**. The script will diff the area, query any missing pixels, and render a final breakdown of contributors sorted by pixel count.
 
 
 
@@ -68,3 +70,4 @@ A high-performance, collaborative pixel art analyzer and leaderboard scanner for
 
 * Use this script responsibly. Setting request intervals too low can trigger temporary IP rate limits from official endpoints.
 * Use this userscript at your own risk. The author is not responsible for any potential consequences resulting from its usage.
+* Contribution to the shared database has been limited to a smaller circle of trusted people with access to a secret key. For more information, please contact the Soularia Alliance on wplace.
