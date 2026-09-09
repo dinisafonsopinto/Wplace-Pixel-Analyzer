@@ -178,7 +178,7 @@
     let authorIdMap = {};
 
     function refreshAuthors() {
-        if (!SHARED_BACKEND_URL || SHARED_BACKEND_URL.includes("YOUR-WORKER-SUBDOMAIN")) return Promise.resolve();
+        if (!SHARED_BACKEND_URL) return Promise.resolve();
         return new Promise((resolve) => {
             const gmXhr = typeof GM !== 'undefined' && GM.xmlHttpRequest ? GM.xmlHttpRequest : GM_xmlhttpRequest;
             gmXhr({
@@ -200,11 +200,11 @@
     // --- Cloudflare Shared Backend API Calls ---
     function fetchBackendTile(tileX, tileY) {
         return new Promise((resolve) => {
-            if (!SHARED_BACKEND_URL || SHARED_BACKEND_URL.includes("YOUR-WORKER-SUBDOMAIN")) return resolve({});
+            if (!SHARED_BACKEND_URL) return resolve({});
 
             // Append a timestamp cache-buster to bypass Cloudflare CDN
             const cacheBuster = Date.now();
-            const url = `${SHARED_BACKEND_URL}/tile/${tileX}/${tileY}?t=${cacheBuster}`;
+            const url = `${SHARED_BACKEND_URL}/tile/${tileX}/${tileY}?t=${cacheBuster}&source=userscript`;
 
             const gmXhr = typeof GM !== 'undefined' && GM.xmlHttpRequest ? GM.xmlHttpRequest : GM_xmlhttpRequest;
             gmXhr({
@@ -239,7 +239,7 @@
 
 
     async function syncBackendTile(tileX, tileY, batchMap) {
-        if (!SHARED_BACKEND_URL || SHARED_BACKEND_URL.includes("YOUR-WORKER-SUBDOMAIN") || Object.keys(batchMap).length === 0) {
+        if (!SHARED_BACKEND_URL || Object.keys(batchMap).length === 0) {
             return;
         }
     
@@ -268,7 +268,7 @@
             const attempt = (currentTry) => {
                 gmXhr({
                     method: "POST",
-                    url: `${SHARED_BACKEND_URL}/tile/${tileX}/${tileY}`,
+                    url: `${SHARED_BACKEND_URL}/tile/${tileX}/${tileY}?source=userscript`,
                     headers: {
                         "Content-Type": "application/json",
                         "Authorization": `Bearer ${secretKey}`
